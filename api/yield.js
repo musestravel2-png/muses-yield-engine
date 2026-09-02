@@ -1,12 +1,36 @@
 import { Groq } from 'groq-sdk';
+import axios from 'axios';
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const AVIATION_API_KEY = process.env.AVIATION_API_KEY;
 
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
     
     try {
-        const { villaName, baselinePrice, regionalOccupancyProxy, flightIntentProxy } = req.body;
+        const { villaName, baselinePrice, regionalOccupancyProxy } = req.body;
+        
+        let flightIntentProxy = 'NORMAL';
+        let aviationData = 0;
+        let flightsHer = 0;
+        let flightsChq = 0;
+
+        try {
+            const [resHer, resChq] = await Promise.all([
+                axios.get(`http://api.aviationstack.com/v1/flights?access_key=${AVIATION_API_KEY}&arr_iata=HER&flight_status=scheduled&limit=100`),
+                axios.get(`http://api.aviationstack.com/v1/flights?access_key=${AVIATION_API_KEY}&arr_iata=CHQ&flight_status=scheduled&limit=100`)
+            ]);
+            
+            flightsHer = resHer.data.pagination?.total || 0;
+            flightsChq = resChq.data.pagination?.total || 0;
+            aviationData = flightsHer + flightsChq;
+            
+            if (aviationData > 80) flightIntentProxy = 'HIGH';
+            else if (aviationData < 30) flightIntentProxy = 'LOW';
+        } catch (aErr) {
+            console.error('Aviation API Error:', aErr.message);
+            flightIntentProxy = 'HIGH'; 
+        }
         
         let score = 50; 
         
@@ -31,12 +55,12 @@ export default async function handler(req, res) {
         const completion = await groq.chat.completions.create({
             messages: [{ 
                 role: "user", 
-                content: `Act as a revenue manager for premium Cretan villas. Explain this pricing decision in one short Greek sentence: Villa ${villaName}, old price ${baselinePrice}, new price ${shadowRate}. Demand score is ${score}/100. Local occupancy is ${regionalOccupancyProxy*100}%. Action: ${action}. Keep it professional, factual, no fluff. Do not use words like luxury, unforgettable.` 
+                content: `Act as a revenue manager for premium Cretan villas. Explain this pricing decision in one short Greek sentence: Villa ${villaName}, old price ${baselinePrice}, new price ${shadowRate}. Demand score is ${score}/100. Action: ${action}. Mention live scheduled flights to Crete (HER: ${flightsHer}, CHQ: ${flightsChq}). Keep it professional, factual, no fluff. Do not use words like luxury, unforgettable, escape.` 
             }],
             model: "openai/gpt-oss-20b",
         });
 
-        const explainability = completion.choices[0]?.message?.content || `Score ${score}/100. Action: ${action}.`;
+        const explainability = completion.choices[0]?.message?.content || `Score ${score}/100. Flights HER: ${flightsHer}, CHQ: ${flightsChq}. Action: ${action}.`;
 
         res.status(200).json({
             villa: villaName,
