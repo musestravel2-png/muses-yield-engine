@@ -33,7 +33,7 @@ export default async function handler(req, res) {
                 role: "user", 
                 content: `Act as a revenue manager for premium Cretan villas. Explain this pricing decision in one short Greek sentence: Villa ${villaName}, old price ${baselinePrice}, new price ${shadowRate}. Demand score is ${score}/100. Local occupancy is ${regionalOccupancyProxy*100}%. Action: ${action}. Keep it professional, factual, no fluff. Do not use words like luxury, unforgettable.` 
             }],
-            model: "llama-3.3-70b-versatile",
+            model: "llama-3.1-70b-versatile",
         });
 
         const explainability = completion.choices[0]?.message?.content || `Score ${score}/100. Action: ${action}.`;
