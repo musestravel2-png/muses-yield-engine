@@ -23,9 +23,16 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
     
     try {
-        const { villaName, baselinePrice, regionalOccupancyProxy } = req.body;
-        if (!villaName || !baselinePrice) {
-            return res.status(400).json({ error: 'Missing required payload parameters.' });
+        const body = req.body || {};
+        
+        // Υποστήριξη και των δύο τύπων αιτημάτων (Batch array ή Single item)
+        let items = [];
+        if (body.items && Array.isArray(body.items)) {
+            items = body.items;
+        } else if (body.villaName && body.baselinePrice) {
+            items = [{ villaName: body.villaName, baselinePrice: body.baselinePrice, month: body.month || 'N/A' }];
+        } else {
+            return res.status(400).json({ error: 'Missing required payload parameters (villaName or items array).' });
         }
 
         const now = Date.now();
@@ -52,9 +59,9 @@ export default async function handler(req, res) {
         const totalFlights = flightsHer + flightsChq;
         const flightIntentProxy = totalFlights > 80 ? 'HIGH' : (totalFlights < 30 ? 'LOW' : 'NORMAL');
 
-        // 2. Apify Multi-Dataset Integration (Airbnb, Booking, VRBO, Google Trends) με Cache 12h
-        let marketOccupancyProxy = regionalOccupancyProxy || 0.75;
-        let searchTrendScore = 50; // Baseline Google Trends index
+        // 2. Apify Multi-Dataset Integration (Airbnb, Booking, VRBO, Trends) με Cache 12h
+        let marketOccupancyProxy = 0.75;
+        let searchTrendScore = 50;
 
         if (APIFY_API_TOKEN) {
             if (globalCache.market.data && (now - globalCache.market.timestamp < CACHE_TTL)) {
@@ -88,14 +95,12 @@ export default async function handler(req, res) {
                             }
                         });
 
-                        // Υπολογισμός μέσης πληρότητας ανταγωνισμού (Airbnb, Booking, VRBO)
                         const validCompetitors = allCompetitorItems.filter(i => i.occupancyRate || i.price || i.rate);
                         if (validCompetitors.length > 0) {
                             const avgOcc = validCompetitors.reduce((acc, curr) => acc + (curr.occupancyRate || curr.rate || 0.75), 0) / validCompetitors.length;
                             marketOccupancyProxy = avgOcc > 1 ? avgOcc / 100 : avgOcc;
                         }
 
-                        // Ανάλυση Google Trends (Search Intent)
                         if (trendItems.length > 0) {
                             const validTrends = trendItems.filter(i => i.value !== undefined || i.score !== undefined || i.interest !== undefined);
                             if (validTrends.length > 0) {
@@ -115,49 +120,81 @@ export default async function handler(req, res) {
             }
         }
 
-        // 3. Υπολογισμός Demand Score & Multiplier
-        let score = 50;
-        if (marketOccupancyProxy >= 0.80) score += 20;
-        else if (marketOccupancyProxy >= 0.60) score += 10;
-        else if (marketOccupancyProxy < 0.40) score -= 15;
+        // 3. Μαζική επεξεργασία όλων των items
+        const results = [];
 
-        if (flightIntentProxy === 'HIGH') score += 15;
-        else if (flightIntentProxy === 'LOW') score -= 10;
+        for (const item of items) {
+            const villaName = item.villaName;
+            const baselinePrice = item.baselinePrice;
+            const regionalOccupancyProxy = item.regionalOccupancyProxy || marketOccupancyProxy;
 
-        // Συνεισφορά Google Trends (αν η ζήτηση αναζήτησης είναι > 60, προσθέτει bonus)
-        if (searchTrendScore >= 70) score += 15;
-        else if (searchTrendScore < 35) score -= 10;
-        
-        score = Math.max(0, Math.min(100, score));
+            let score = 50;
+            if (regionalOccupancyProxy >= 0.80) score += 20;
+            else if (regionalOccupancyProxy >= 0.60) score += 10;
+            else if (regionalOccupancyProxy < 0.40) score -= 15;
 
-        let multiplier = 1.0;
-        let action = 'HOLD';
-        if (score >= 75) { action = 'YIELD_UP'; multiplier = 1.15 + ((score - 75) / 25) * 0.20; }
-        else if (score >= 60) { action = 'YIELD_UP'; multiplier = 1.05 + ((score - 60) / 15) * 0.09; }
-        else if (score <= 45) { action = 'YIELD_DOWN'; multiplier = 0.75 + (score / 45) * 0.24; }
+            if (flightIntentProxy === 'HIGH') score += 15;
+            else if (flightIntentProxy === 'LOW') score -= 10;
 
-        const shadowRate = Math.round((baselinePrice * multiplier) / 5) * 5;
+            if (searchTrendScore >= 70) score += 15;
+            else if (searchTrendScore < 35) score -= 10;
+            
+            score = Math.max(0, Math.min(100, score));
 
-        // 4. Groq AI Αιτιολόγηση
-        let explainability = `Demand Score: ${score}/100. Market Occ: ${(marketOccupancyProxy * 100).toFixed(0)}%. Trends: ${searchTrendScore.toFixed(0)}/100.`;
+            let multiplier = 1.0;
+            let action = 'HOLD';
+            if (score >= 75) { action = 'YIELD_UP'; multiplier = 1.15 + ((score - 75) / 25) * 0.20; }
+            else if (score >= 60) { action = 'YIELD_UP'; multiplier = 1.05 + ((score - 60) / 15) * 0.09; }
+            else if (score <= 45) { action = 'YIELD_DOWN'; multiplier = 0.75 + (score / 45) * 0.24; }
+
+            const shadowRate = Math.round((baselinePrice * multiplier) / 5) * 5;
+            const explainability = `Demand Score: ${score}/100. Market Occ: ${(regionalOccupancyProxy * 100).toFixed(0)}%. Trends: ${searchTrendScore.toFixed(0)}/100. Flights (HER:${flightsHer}, CHQ:${flightsChq}).`;
+
+            results.push({
+                villaName: villaName,
+                month: item.month || 'N/A',
+                baselinePrice: baselinePrice,
+                shadowRate: shadowRate,
+                demandScore: score,
+                action: action,
+                explainability: explainability
+            });
+        }
+
+        // 4. Groq AI Σύνοψη
+        let aiSummary = `Market analysis synchronized. Flights (HER:${flightsHer}, CHQ:${flightsChq}), Occ: ${(marketOccupancyProxy*100).toFixed(0)}%.`;
         try {
             const completion = await groq.chat.completions.create({
                 messages: [{ 
                     role: "user", 
-                    content: `Act as a revenue manager for premium Cretan villas. Explain this pricing decision in one short Greek sentence: Villa ${villaName}, old price ${baselinePrice}, new price ${shadowRate}. Demand score is ${score}/100. Action: ${action}. Mention market occupancy at ${(marketOccupancyProxy * 100).toFixed(0)}% and search trend index at ${searchTrendScore.toFixed(0)}. Keep it professional, factual, no fluff. Do not use words like luxury, unforgettable, escape.` 
+                    content: `Act as chief revenue officer for Muses villas in Crete. Summarize in one professional Greek sentence the current market state: Total scheduled flights (HER: ${flightsHer}, CHQ: ${flightsChq}), Market occupancy index at ${(marketOccupancyProxy*100).toFixed(0)}%. No fluff, strict business tone.` 
                 }],
                 model: "openai/gpt-oss-20b",
             });
-            explainability = completion.choices[0]?.message?.content || explainability;
-        } catch (error) {}
+            aiSummary = completion.choices[0]?.message?.content || aiSummary;
+        } catch (err) {}
+
+        // Επιστροφή απάντησης ανάλογα με τον τύπο κλήσης
+        if (!body.items && results.length === 1) {
+            return res.status(200).json({
+                villa: results[0].villaName,
+                baseline: results[0].baselinePrice,
+                demandScore: results[0].demandScore,
+                action: results[0].action,
+                shadowRate: results[0].shadowRate,
+                explainability: results[0].explainability
+            });
+        }
 
         res.status(200).json({
-            villa: villaName,
-            baseline: baselinePrice,
-            demandScore: score,
-            action: action,
-            shadowRate: shadowRate,
-            explainability: explainability
+            success: true,
+            marketIntelligence: {
+                flightsHER: flightsHer,
+                flightsCHQ: flightsChq,
+                marketOccupancy: marketOccupancyProxy,
+                aiSummary: aiSummary
+            },
+            results: results
         });
 
     } catch (error) {
