@@ -20,24 +20,37 @@ let globalCache = {
 
 const CACHE_TTL = 12 * 60 * 60 * 1000; // 12 Hours
 
+// Ορίζουμε το Cascade (Τη σειρά προτεραιότητας των μοντέλων)
+const OLLAMA_MODELS_CASCADE = [
+    'gpt-oss:120b',          // 1η Επιλογή
+    'deepseek-v4-flash',     // 2η Επιλογή (Πολύ γρήγορο)
+    'mistral-large-3:675b'   // 3η Επιλογή (Βαρύ & Αξιόπιστο)
+];
+
 async function getResilientAISummary(prompt) {
     if (OLLAMA_API_KEY) {
-        try {
-            const ollamaRes = await axios.post('https://ollama.com/api/chat', {
-                model: 'gpt-oss:120b',
-                messages: [{ role: "user", content: prompt }],
-                stream: false
-            }, {
-                headers: { 'Authorization': `Bearer ${OLLAMA_API_KEY}`, 'Content-Type': 'application/json' },
-                timeout: 8000
-            });
-            const content = ollamaRes.data?.message?.content;
-            if (content) return content;
-        } catch (e) {
-            console.error('Ollama Cloud failed, failing over to Groq:', e.message);
+        // Λούπα: Δοκιμάζει το καθένα με τη σειρά
+        for (const model of OLLAMA_MODELS_CASCADE) {
+            try {
+                const ollamaRes = await axios.post('https://ollama.com/api/chat', {
+                    model: model,
+                    messages: [{ role: "user", content: prompt }],
+                    stream: false
+                }, {
+                    headers: { 'Authorization': `Bearer ${OLLAMA_API_KEY}`, 'Content-Type': 'application/json' },
+                    timeout: 8000 // Αν κάνει πάνω από 8 δευτερόλεπτα, πάει στο επόμενο
+                });
+                
+                const content = ollamaRes.data?.message?.content;
+                if (content) return content; // Αν πέτυχε, επιστρέφει το αποτέλεσμα και σταματάει
+                
+            } catch (e) {
+                console.error(`Ollama model ${model} failed, trying next... Error:`, e.message);
+            }
         }
     }
 
+    // Αν ΟΛΑ τα μοντέλα του Ollama αποτύχουν, τότε (και μόνο τότε) πάει στο Groq
     try {
         const completion = await groq.chat.completions.create({
             messages: [{ role: "user", content: prompt }],
@@ -51,7 +64,6 @@ async function getResilientAISummary(prompt) {
 
     return "Market analysis synchronized via Muses Engine.";
 }
-
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
