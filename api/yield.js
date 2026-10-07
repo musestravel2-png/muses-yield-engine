@@ -1,10 +1,24 @@
 import axios from 'axios';
 import { Groq } from 'groq-sdk';
 
+// =====================================================================
+// MUSES · MASTER RATES ENGINE v2 — Σύμβουλος τιμολόγησης (ανεξάρτητη μηχανή)
+// Συμβατή με τις υπάρχουσες κλήσεις (villaName, baselinePrice, month, assetScore[, regionalOccupancyProxy]).
+// ΝΕΑ προαιρετικά πεδία ανά item:
+//   month: "2027-07" (ή "07/2027")               → ο μήνας που τιμολογούμε (απαραίτητος για ακρίβεια)
+//   market: { zone, asOf, occ, occLY, adr, adrLY, musesOcc, musesAdr }   ← από KEYDATA_SIGNALS.json (πληρότητες σε %)
+//   holidays: { "Γερμανία": 31, "Ολλανδία": 9, ... }                      ← ημέρες διακοπών ανά χώρα στον μήνα
+//   sourceMarkets: { "Γερμανία": 0.35, "Ηνωμένο Βασίλειο": 0.25, ... }    ← μερίδιο πελατών ανά χώρα (προαιρετικό)
+//   beyondPrice: 420                                                     ← πρόταση Beyond για σύγκριση
+// Κανόνας ειλικρίνειας: χωρίς ΠΡΑΓΜΑΤΙΚΑ δεδομένα δεν προτείνεται τιμή (action: INSUFFICIENT_DATA).
+// =====================================================================
+
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const AVIATION_API_KEY = process.env.AVIATION_API_KEY;
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
+const ENGINE_VERSION = 'v2.1';                                   // ← φαίνεται στο μήνυμα του Master Rates· ανοίγοντας το URL στον browser
+const MUSES_API_KEY = process.env.MUSES_API_KEY || '';          // αν οριστεί, απαιτείται header x-muses-key
 
 const DATASETS = {
     airbnb: process.env.APIFY_AIRBNB_DATASET_ID || '',
@@ -13,246 +27,195 @@ const DATASETS = {
     trends: process.env.APIFY_TRENDS_DATASET_ID || ''
 };
 
-let globalCache = {
-    flights: { data: null, timestamp: 0 },
-    market: { data: null, timestamp: 0 }
-};
-
-const CACHE_TTL = 12 * 60 * 60 * 1000; // 12 Hours
-
-// Ορίζουμε το Cascade (Τη σειρά προτεραιότητας των μοντέλων)
-const OLLAMA_MODELS_CASCADE = [
-    'gpt-oss:120b',          // 1η Επιλογή
-    'deepseek-v4-flash',     // 2η Επιλογή (Πολύ γρήγορο)
-    'mistral-large-3:675b'   // 3η Επιλογή (Βαρύ & Αξιόπιστο)
-];
+let globalCache = { flights: { data: null, timestamp: 0 }, market: { data: null, timestamp: 0 } };
+const CACHE_TTL = 12 * 60 * 60 * 1000;
+const OLLAMA_MODELS_CASCADE = ['gpt-oss:120b', 'deepseek-v4-flash', 'mistral-large-3:675b'];
 
 async function getResilientAISummary(prompt) {
     if (OLLAMA_API_KEY) {
-        // Λούπα: Δοκιμάζει το καθένα με τη σειρά
         for (const model of OLLAMA_MODELS_CASCADE) {
             try {
-                const ollamaRes = await axios.post('https://ollama.com/api/chat', {
-                    model: model,
-                    messages: [{ role: "user", content: prompt }],
-                    stream: false
-                }, {
-                    headers: { 'Authorization': `Bearer ${OLLAMA_API_KEY}`, 'Content-Type': 'application/json' },
-                    timeout: 8000 // Αν κάνει πάνω από 8 δευτερόλεπτα, πάει στο επόμενο
-                });
-                
-                const content = ollamaRes.data?.message?.content;
-                if (content) return content; // Αν πέτυχε, επιστρέφει το αποτέλεσμα και σταματάει
-                
-            } catch (e) {
-                console.error(`Ollama model ${model} failed, trying next... Error:`, e.message);
-            }
+                const r = await axios.post('https://ollama.com/api/chat', { model, messages: [{ role: "user", content: prompt }], stream: false },
+                    { headers: { 'Authorization': `Bearer ${OLLAMA_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 3500 });
+                const content = r.data?.message?.content; if (content) return content;
+            } catch (e) { console.error(`Ollama model ${model} failed:`, e.message); }
         }
     }
-
-    // Αν ΟΛΑ τα μοντέλα του Ollama αποτύχουν, τότε (και μόνο τότε) πάει στο Groq
     try {
-        const completion = await groq.chat.completions.create({
-            messages: [{ role: "user", content: prompt }],
-            model: "openai/gpt-oss-20b",
-        });
-        const content = completion.choices[0]?.message?.content;
-        if (content) return content;
-    } catch (e) {
-        console.error('Groq fallback failed:', e.message);
-    }
-
-    return "Market analysis synchronized via Muses Engine.";
+        const c = await groq.chat.completions.create({ messages: [{ role: "user", content: prompt }], model: "openai/gpt-oss-20b" });
+        const content = c.choices[0]?.message?.content; if (content) return content;
+    } catch (e) { console.error('Groq fallback failed:', e.message); }
+    return null;
 }
-export default async function handler(req, res) {
-    if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
+// ── Βοηθητικά ──
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const num = v => (v === null || v === undefined || v === '' || isNaN(Number(v))) ? null : Number(v);
+function parseMonth(m) {           // "2027-07" | "07/2027" | "7/2027" → {y, m}
+    const s = String(m || '').trim(); let r = s.match(/^(\d{4})-(\d{1,2})$/); if (r) return { y: +r[1], m: +r[2] };
+    r = s.match(/^(\d{1,2})[\/.-](\d{4})$/); if (r) return { y: +r[2], m: +r[1] }; return null;
+}
+function leadDays(pm) { if (!pm) return null; const mid = new Date(pm.y, pm.m - 1, 15); return Math.round((mid - new Date()) / 86400000); }
+
+// ── Σήματα (κάθε σήμα: τιμή -1…+1, βάρος, και αν είναι πραγματικό δεδομένο) ──
+function buildSignals(item, ctx) {
+    const S = [], pm = parseMonth(item.month), lead = leadDays(pm);
+    const near = lead === null ? 0.5 : (lead <= 30 ? 1 : lead <= 60 ? 0.5 : 0);   // πτήσεις/ανταγωνιστές: αξία μόνο για κοντινούς μήνες
+    const mk = item.market || {};
+    const occ = num(mk.occ), occLY = num(mk.occLY), adr = num(mk.adr), mOcc = num(mk.musesOcc), mAdr = num(mk.musesAdr);
+    let freshness = null;
+    if (mk.asOf) { const d = new Date(mk.asOf); if (!isNaN(d)) freshness = Math.round((new Date() - d) / 86400000); }
+    const fresh = freshness === null ? 1 : (freshness <= 30 ? 1 : freshness <= 60 ? 0.6 : 0.3);
+    // 1. Ρυθμός αγοράς έναντι πέρσι (KeyData)
+    if (occ !== null && occLY !== null && occLY > 0) {
+        const pace = occ / occLY - 1;
+        S.push({ key: 'marketPace', label: 'Ρυθμός αγοράς έναντι πέρσι', value: clamp(pace / 0.4, -1, 1), weight: 0.35 * fresh, real: true,
+                 text: `Η αγορά${mk.zone ? ' ' + mk.zone : ''} έχει κλείσει ${occ.toFixed(1)}% έναντι ${occLY.toFixed(1)}% πέρσι (${pace >= 0 ? '+' : ''}${Math.round(pace * 100)}%)` });
+    }
+    // 2. Πόσο γρήγορα γεμίζουμε εμείς έναντι αγοράς (MPI)
+    if (occ !== null && occ > 0 && mOcc !== null) {
+        const mpi = mOcc / occ;
+        S.push({ key: 'ourPace', label: 'Ρυθμός μας έναντι αγοράς', value: clamp((mpi - 1) / 0.5, -1, 1), weight: 0.2 * fresh, real: true,
+                 text: `Γεμίζουμε ${mpi >= 1 ? (mpi).toFixed(1) + '× γρηγορότερα' : (1 / Math.max(mpi, 0.01)).toFixed(1) + '× πιο αργά'} από την αγορά (${mOcc.toFixed(1)}% έναντι ${occ.toFixed(1)}%)` });
+    }
+    // 3. Αργίες χωρών-πελατών στον μήνα
+    if (item.holidays && typeof item.holidays === 'object' && Object.keys(item.holidays).length) {
+        const w = item.sourceMarkets && Object.keys(item.sourceMarkets).length ? item.sourceMarkets : null;
+        let score = 0, tot = 0;
+        Object.entries(item.holidays).forEach(([c, days]) => { const share = w ? (num(w[c]) || 0) : 1; score += share * clamp((num(days) || 0) / 30, 0, 1); tot += share; });
+        if (!w) tot = Math.max(tot, 12);                          // χωρίς μερίδια: ως ποσοστό των ~12+ αγορών που παρακολουθούμε
+        const intensity = tot > 0 ? clamp(score / tot, 0, 1) : 0;
+        const top = Object.entries(item.holidays).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([c, d]) => `${c} (${d} ημ.)`).join(', ');
+        S.push({ key: 'holidays', label: 'Διακοπές χωρών-πελατών', value: clamp(intensity * 2 - 0.4, -0.4, 1), weight: 0.15, real: true, text: `Διακοπές στον μήνα: ${top}` });
+    }
+    // 4. Πτήσεις (ζωντανά δεδομένα — έχουν νόημα μόνο για κοντινούς μήνες)
+    if (ctx.flights.real && near > 0) {
+        const f = ctx.flights.intent === 'HIGH' ? 1 : ctx.flights.intent === 'LOW' ? -1 : 0;
+        S.push({ key: 'flights', label: 'Πτήσεις HER/CHQ', value: f, weight: 0.15 * near, real: true, text: `Πτήσεις τώρα: ${ctx.flights.total} (${ctx.flights.intent})` });
+    }
+    // 5. Πληρότητα ανταγωνιστών (Apify — μόνο αν είναι πραγματική & για κοντινούς μήνες)
+    const regional = num(item.regionalOccupancyProxy);
+    const compOcc = regional !== null ? (regional > 1 ? regional / 100 : regional) : (ctx.competitors.real ? ctx.competitors.occupancy : null);
+    if (compOcc !== null && near > 0) {
+        S.push({ key: 'competitors', label: 'Πληρότητα ανταγωνιστών', value: compOcc >= 0.85 ? 1 : compOcc >= 0.65 ? 0.4 : compOcc < 0.45 ? -1 : 0, weight: 0.1 * near, real: true,
+                 text: `Ανταγωνιστές: ${(compOcc * 100).toFixed(0)}% πληρότητα` });
+    }
+    return { signals: S, lead, freshness, adr, mAdr, occ, mOcc };
+}
+
+function priceFor(item, ctx) {
+    const baselinePrice = num(item.baselinePrice), assetScore = num(item.assetScore) || 150;
+    const B = buildSignals(item, ctx), S = B.signals.filter(s => s.real && s.weight > 0);
+    const wsum = S.reduce((a, s) => a + s.weight, 0);
+    // Κατηγορία ακινήτου (όπως πριν): οι κορυφαίες βίλες «αντέχουν» να μη ρίξουν τιμή και πιέζουν ψηλότερα στη ζήτηση
+    let dropResistance = 0, pushPower = 0, tierLabel = 'Quality';
+    if (assetScore >= 180) { dropResistance = 0.25; pushPower = 0.15; tierLabel = 'Elite Sanctuary'; }
+    else if (assetScore >= 160) { dropResistance = 0.12; pushPower = 0.08; tierLabel = 'Premium Retreat'; }
+    else if (assetScore < 140) tierLabel = 'Under Review';
+    const base = { villaName: item.villaName, month: item.month || 'N/A', baselinePrice, tier: tierLabel };
+    if (!baselinePrice) return { ...base, action: 'INVALID', shadowRate: null, explainability: 'Λείπει η τιμή βάσης.' };
+    const hasCore = S.some(s => s.key !== 'holidays');      // οι αργίες ΕΝΙΣΧΥΟΥΝ, αλλά δεν αρκούν μόνες τους
+    if (wsum < 0.15 || !hasCore) {                           // ΤΙΜΙΟΤΗΤΑ: χωρίς αρκετά πραγματικά δεδομένα, καμία πρόταση
+        const why = B.freshness !== null && B.freshness > 60 ? `Τα στοιχεία αγοράς είναι παλιά (${B.freshness} ημερών)· χρειάζεται νέο export KeyData.`
+                  : 'Δεν υπάρχουν αρκετά πραγματικά δεδομένα αγοράς για αυτόν τον μήνα (στείλτε market από το KEYDATA_SIGNALS.json).';
+        return { ...base, action: 'INSUFFICIENT_DATA', shadowRate: baselinePrice, marketDemand: null, demandScore: null, confidence: 'NONE', drivers: [], dataAgeDays: B.freshness, leadDays: B.lead,
+                 explainability: why + ' Κρατήστε την τιμή βάσης.' };
+    }
+    const signal = S.reduce((a, s) => a + s.weight * s.value, 0) / wsum;          // -1 … +1
+    const demandScore = Math.round(50 + 50 * signal);
+    let adj = signal * 0.15;                                                      // ζήτηση: έως ±15%
+    if (adj > 0) adj += pushPower * signal; else adj *= (1 - dropResistance);
+    // Θέση τιμής έναντι αγοράς (ARI): αν γεμίζουμε γρηγορότερα ΚΑΙ είμαστε φθηνότεροι → κλείνουμε μέρος του κενού (και αντίστροφα)
+    let gapNote = null;
+    if (B.adr && B.mAdr && B.occ && B.mOcc !== null) {
+        const ari = B.mAdr / B.adr, mpi = B.mOcc / B.occ;
+        if (ari < 0.95 && mpi > 1.1) { const g = clamp((1 - ari) * 0.3, 0, 0.1); adj += g; gapNote = `Είμαστε ${Math.round((1 - ari) * 100)}% φθηνότεροι από την αγορά ενώ γεμίζουμε γρηγορότερα → +${Math.round(g * 100)}%`; }
+        else if (ari > 1.05 && mpi < 0.9) { const g = clamp((ari - 1) * 0.3, 0, 0.1) * (1 - dropResistance); adj -= g; gapNote = `Είμαστε ${Math.round((ari - 1) * 100)}% ακριβότεροι από την αγορά ενώ γεμίζουμε πιο αργά → −${Math.round(g * 100)}%`; }
+    }
+    adj = clamp(adj, -0.25, 0.25);
+    const shadowRate = Math.round(baselinePrice * (1 + adj) / 5) * 5;
+    const action = adj > 0.02 ? 'YIELD_UP' : adj < -0.02 ? 'YIELD_DOWN' : 'HOLD';
+    const confidence = wsum >= 0.6 && (B.freshness === null || B.freshness <= 30) ? 'HIGH' : wsum >= 0.35 ? 'MEDIUM' : 'LOW';
+    const drivers = S.sort((a, b) => Math.abs(b.weight * b.value) - Math.abs(a.weight * a.value)).map(s => ({ key: s.key, label: s.label, effect: Math.round(s.value * 100) / 100, weight: Math.round(s.weight * 100) / 100, text: s.text }));
+    if (gapNote) drivers.push({ key: 'priceGap', label: 'Θέση τιμής έναντι αγοράς', text: gapNote });
+    const out = { ...base, shadowRate, range: { min: Math.round(shadowRate * 0.97 / 5) * 5, max: Math.round(shadowRate * 1.03 / 5) * 5 },
+                  marketDemand: demandScore, demandScore, action, confidence, drivers, leadDays: B.lead, dataAgeDays: B.freshness,
+                  explainability: `Ζήτηση ${demandScore}/100 · ${action} (${adj >= 0 ? '+' : ''}${Math.round(adj * 100)}%) · Βεβαιότητα ${confidence} · ${drivers.slice(0, 3).map(d => d.text).join(' · ')}` };
+    const bp = num(item.beyondPrice);
+    if (bp) { const d = shadowRate / bp - 1; out.beyond = { price: bp, deltaPct: Math.round(d * 1000) / 10, verdict: Math.abs(d) <= 0.05 ? 'Συμφωνία με Beyond' : (d > 0 ? 'Πάνω από το Beyond' : 'Κάτω από το Beyond') }; }
+    return out;
+}
+
+export { priceFor, buildSignals, parseMonth };   // για δοκιμές
+
+export default async function handler(req, res) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-muses-key');
+    if (req.method === 'OPTIONS') return res.status(200).end();
+    if (req.method === 'GET') return res.status(200).json({ engine: 'Muses Master Rates', engineVersion: ENGINE_VERSION, ok: true });   // έλεγχος έκδοσης από browser
+    if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+    if (MUSES_API_KEY && (req.headers?.['x-muses-key'] || '') !== MUSES_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     try {
         const body = req.body || {};
         let items = [];
-        
-        if (body.items && Array.isArray(body.items)) {
-            items = body.items;
-        } else if (body.villaName && body.baselinePrice) {
-            // [FIX]: Προστέθηκε και εδώ το assetScore για μεμονωμένες κλήσεις
-            items = [{ 
-                villaName: body.villaName, 
-                baselinePrice: body.baselinePrice, 
-                month: body.month || 'N/A',
-                assetScore: body.assetScore || 150 
-            }];
-        } else {
-            return res.status(400).json({ error: 'Missing required payload parameters.' });
-        }
-
+        if (Array.isArray(body.items)) items = body.items;
+        else if (body.villaName && body.baselinePrice) items = [{ ...body, assetScore: body.assetScore || 150 }];
+        else return res.status(400).json({ error: 'Missing required payload parameters.' });
         const now = Date.now();
 
-        // ── 1. AviationStack (HER & CHQ) ──
-        let flightsHer = 45;
-        let flightsChq = 25;
-        let flightsDataSource = 'CACHED';
-
-        if (globalCache.flights.data && (now - globalCache.flights.timestamp < CACHE_TTL)) {
-            flightsHer = globalCache.flights.data.her;
-            flightsChq = globalCache.flights.data.chq;
-        } else {
+        // ── Πτήσεις (AviationStack) & ανταγωνιστές (Apify): ΠΑΡΑΛΛΗΛΑ — ΠΟΤΕ «πλαστά» νούμερα: αν αποτύχει, real=false ──
+        const t0 = Date.now();
+        const flights = { real: false, her: null, chq: null, total: null, intent: null, source: 'UNAVAILABLE' };
+        const competitors = { real: false, occupancy: null, trend: null, sample: 0, source: 'UNAVAILABLE' };
+        const fetchFlights = async () => {
+        if (globalCache.flights.data && (now - globalCache.flights.timestamp < CACHE_TTL)) Object.assign(flights, globalCache.flights.data, { source: 'CACHED' });
+        else if (AVIATION_API_KEY) {
             try {
-                const [resHer, resChq] = await Promise.all([
-                    axios.get(`http://api.aviationstack.com/v1/flights?access_key=${AVIATION_API_KEY}&arr_iata=HER&flight_status=scheduled&limit=100`),
-                    axios.get(`http://api.aviationstack.com/v1/flights?access_key=${AVIATION_API_KEY}&arr_iata=CHQ&flight_status=scheduled&limit=100`)
-                ]);
-                flightsHer = resHer.data.pagination?.total || 45;
-                flightsChq = resChq.data.pagination?.total || 25;
-                
-                globalCache.flights = { data: { her: flightsHer, chq: flightsChq }, timestamp: now };
-                flightsDataSource = 'LIVE';
-            } catch (e) {
-                console.error('Aviation API Error:', e.message);
-                flightsDataSource = 'FALLBACK';
-            }
-        }
-
-        const totalFlights = flightsHer + flightsChq;
-        const flightIntentProxy = totalFlights > 80 ? 'HIGH' : (totalFlights < 30 ? 'LOW' : 'NORMAL');
-
-        // ── 2. Apify Multi-Dataset ──
-        let marketOccupancyProxy = 0.75;
-        let searchTrendScore = 50;
-        let marketDataSource = 'CACHED';
-
-        if (globalCache.market.data && (now - globalCache.market.timestamp < CACHE_TTL)) {
-            marketOccupancyProxy = globalCache.market.data.occupancy;
-            searchTrendScore = globalCache.market.data.trend;
-        } else if (APIFY_API_TOKEN) {
+                const [h, c] = await Promise.all([
+                    axios.get(`http://api.aviationstack.com/v1/flights?access_key=${AVIATION_API_KEY}&arr_iata=HER&flight_status=scheduled&limit=100`, { timeout: 8000 }),
+                    axios.get(`http://api.aviationstack.com/v1/flights?access_key=${AVIATION_API_KEY}&arr_iata=CHQ&flight_status=scheduled&limit=100`, { timeout: 8000 })]);
+                const her = num(h.data?.pagination?.total), chq = num(c.data?.pagination?.total);
+                if (her !== null && chq !== null) {
+                    const total = her + chq; const data = { real: true, her, chq, total, intent: total > 80 ? 'HIGH' : (total < 30 ? 'LOW' : 'NORMAL') };
+                    Object.assign(flights, data, { source: 'LIVE' }); globalCache.flights = { data, timestamp: now };
+                }
+            } catch (e) { console.error('Aviation API Error:', e.message); }
+        } };
+        // ── Ανταγωνιστές (Apify) — μόνο πεδία ΠΛΗΡΟΤΗΤΑΣ (όχι τιμές), μόνο έγκυρες τιμές ──
+        const fetchCompetitors = async () => {
+        if (globalCache.market.data && (now - globalCache.market.timestamp < CACHE_TTL)) Object.assign(competitors, globalCache.market.data, { source: 'CACHED' });
+        else if (APIFY_API_TOKEN) {
             try {
-                const endpoints = [];
-                const keys = [];
-
-                for (const [key, id] of Object.entries(DATASETS)) {
-                    if (id) {
-                        endpoints.push(axios.get(`https://api.apify.com/v2/datasets/${id}/items?token=${APIFY_API_TOKEN}&limit=50`));
-                        keys.push(key);
-                    }
+                const keys = Object.keys(DATASETS).filter(k => DATASETS[k]);
+                const resp = await Promise.all(keys.map(k => axios.get(`https://api.apify.com/v2/datasets/${DATASETS[k]}/items?token=${APIFY_API_TOKEN}&limit=50`, { timeout: 8000 })));
+                let occs = [], trends = [];
+                resp.forEach((r, i) => (Array.isArray(r.data) ? r.data : []).forEach(it => {
+                    if (keys[i] === 'trends') { const t = num(it.value ?? it.score ?? it.interest); if (t !== null) trends.push(t); return; }
+                    let o = num(it.occupancyRate ?? it.occupancy); if (o === null) return; if (o > 1) o = o / 100; if (o >= 0 && o <= 1) occs.push(o);
+                }));
+                if (occs.length >= 5) {
+                    const data = { real: true, occupancy: occs.reduce((a, b) => a + b, 0) / occs.length, sample: occs.length, trend: trends.length ? trends.reduce((a, b) => a + b, 0) / trends.length : null };
+                    Object.assign(competitors, data, { source: 'LIVE' }); globalCache.market = { data, timestamp: now };
                 }
-
-                if (endpoints.length > 0) {
-                    const responses = await Promise.all(endpoints);
-                    let allCompetitorItems = [];
-                    let trendItems = [];
-
-                    responses.forEach((resp, idx) => {
-                        const sourceKey = keys[idx];
-                        if (resp.data && Array.isArray(resp.data)) {
-                            if (sourceKey === 'trends') trendItems = resp.data;
-                            else allCompetitorItems = allCompetitorItems.concat(resp.data);
-                        }
-                    });
-
-                    const validCompetitors = allCompetitorItems.filter(i => i.occupancyRate || i.price || i.rate || i.occupancy);
-                    if (validCompetitors.length > 0) {
-                        const avgOcc = validCompetitors.reduce((acc, curr) => acc + (curr.occupancyRate || curr.rate || curr.occupancy || 0.75), 0) / validCompetitors.length;
-                        marketOccupancyProxy = avgOcc > 1 ? avgOcc / 100 : avgOcc;
-                        marketDataSource = 'LIVE';
-                    }
-
-                    const validTrends = trendItems.filter(i => i.value !== undefined || i.score !== undefined || i.interest !== undefined);
-                    if (validTrends.length > 0) {
-                        searchTrendScore = validTrends.reduce((acc, curr) => acc + (curr.value || curr.score || curr.interest || 50), 0) / validTrends.length;
-                    }
-
-                    globalCache.market = { data: { occupancy: marketOccupancyProxy, trend: searchTrendScore }, timestamp: now };
-                }
-            } catch (e) {
-                console.error('Apify Fetch Error:', e.message);
-            }
-        }
-
-        // ── 3. Υπολογισμός Demand Score & ASSET QUALITY MULTIPLIER ──
-        const results = [];
-        for (const item of items) {
-            const villaName = item.villaName;
-            const baselinePrice = item.baselinePrice;
-            const regionalOccupancyProxy = item.regionalOccupancyProxy || marketOccupancyProxy;
-            const assetScore = item.assetScore || 150; // Η βαθμολογία του ακινήτου!
-
-            let score = 50;
-            if (regionalOccupancyProxy >= 0.80) score += 20;
-            else if (regionalOccupancyProxy >= 0.60) score += 10;
-            else if (regionalOccupancyProxy < 0.40) score -= 15;
-
-            if (flightIntentProxy === 'HIGH') score += 15;
-            else if (flightIntentProxy === 'LOW') score -= 10;
-
-            if (searchTrendScore >= 70) score += 15;
-            else if (searchTrendScore < 35) score -= 10;
-
-            // BONUS / PENALTY Βάσει Ποιότητας Καταλύματος
-            if (assetScore >= 180) score += 10;       // Elite
-            else if (assetScore >= 160) score += 5;   // Premium
-            else if (assetScore < 130) score -= 5;    // Under Review
-
-            score = Math.max(0, Math.min(100, score));
-
-            // ASSET DROP RESISTANCE: Τα ακριβά δεν "ξεπουλάνε" εύκολα
-            let dropResistance = 0;
-            let tierLabel = "Quality";
-            
-            if (assetScore >= 180) { dropResistance = 0.15; tierLabel = "Elite"; }
-            else if (assetScore >= 160) { dropResistance = 0.08; tierLabel = "Premium"; }
-            else if (assetScore < 140) { tierLabel = "Under Review"; }
-
-            let multiplier = 1.0;
-            let action = 'HOLD';
-            
-            if (score >= 75) { 
-                action = 'YIELD_UP'; 
-                multiplier = 1.15 + ((score - 75) / 25) * 0.20; 
-                // Τα Elite/Premium διεκδικούν μεγαλύτερο premium όταν η αγορά έχει ζήτηση
-                if (assetScore >= 160) multiplier += 0.05; 
-            }
-            else if (score >= 60) { 
-                action = 'YIELD_UP'; 
-                multiplier = 1.05 + ((score - 60) / 15) * 0.09; 
-            }
-            else if (score <= 45) { 
-                action = 'YIELD_DOWN'; 
-                let rawDrop = 0.75 + (score / 45) * 0.24; 
-                // Εφαρμογή Αντίστασης: Μειώνουμε το πόσο θα πέσει η τιμή βάσει ποιότητας
-                multiplier = rawDrop + ((1 - rawDrop) * dropResistance);
-            }
-
-            const shadowRate = Math.round((baselinePrice * multiplier) / 5) * 5;
-            const explainability = `Demand: ${score}/100. Occ: ${(regionalOccupancyProxy * 100).toFixed(0)}%. Asset Tier: ${tierLabel} (Score: ${assetScore.toFixed(0)}).`;
-
-            results.push({
-                villaName, month: item.month || 'N/A', baselinePrice, shadowRate,
-                demandScore: score, action, explainability
-            });
-        }
-
-        // ── 4. Resilient AI Market Summary ──
-        const prompt = `Act as chief revenue officer for Muses villas in Crete. Summarize in one professional Greek sentence the current market state: Total scheduled flights (HER: ${flightsHer}, CHQ: ${flightsChq}), Market occupancy index at ${(marketOccupancyProxy*100).toFixed(0)}%. No fluff, strict business tone.`;
-        const aiSummary = await getResilientAISummary(prompt);
+            } catch (e) { console.error('Apify Fetch Error:', e.message); }
+        } };
+        await Promise.all([fetchFlights(), fetchCompetitors()]);
+        const ctx = { flights, competitors };
+        const results = items.map(it => priceFor(it, ctx));
+        const dataQuality = { flights: flights.source, competitors: competitors.source, keydata: items.some(i => i.market) ? 'PROVIDED' : 'MISSING', holidays: items.some(i => i.holidays) ? 'PROVIDED' : 'MISSING' };
 
         if (!body.items && results.length === 1) {
-            return res.status(200).json({
-                villa: results[0].villaName, baseline: results[0].baselinePrice,
-                demandScore: results[0].demandScore, action: results[0].action,
-                shadowRate: results[0].shadowRate, explainability: results[0].explainability,
-                dataQuality: { flights: flightsDataSource, market: marketDataSource }
-            });
+            const r = results[0];
+            return res.status(200).json({ villa: r.villaName, baseline: r.baselinePrice, demandScore: r.demandScore, action: r.action, shadowRate: r.shadowRate, engineVersion: ENGINE_VERSION,
+                                          range: r.range, confidence: r.confidence, drivers: r.drivers, beyond: r.beyond, explainability: r.explainability, dataQuality });
         }
-
-        res.status(200).json({
-            success: true,
-            marketIntelligence: {
-                flightsHER: flightsHer, flightsCHQ: flightsChq,
-                marketOccupancy: marketOccupancyProxy, aiSummary,
-                dataQuality: { flights: flightsDataSource, market: marketDataSource }
-            },
-            results
-        });
-
+        let aiSummary = null;
+        if (body.summary !== false && Date.now() - t0 < 5000) {
+            const ups = results.filter(r => r.action === 'YIELD_UP').length, downs = results.filter(r => r.action === 'YIELD_DOWN').length;
+            aiSummary = await getResilientAISummary(`Act as chief revenue officer for Muses villas in Crete. In one professional Greek sentence summarize: ${results.length} price checks, ${ups} suggest increase, ${downs} decrease. Data: flights ${flights.source}${flights.real ? ' (' + flights.total + ')' : ''}, KeyData market ${dataQuality.keydata}, holidays ${dataQuality.holidays}. No fluff.`);
+        }
+        res.status(200).json({ success: true, engineVersion: ENGINE_VERSION, marketIntelligence: { flightsHER: flights.her, flightsCHQ: flights.chq, competitorOccupancy: competitors.occupancy, aiSummary, dataQuality }, results });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
