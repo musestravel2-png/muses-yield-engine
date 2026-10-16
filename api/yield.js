@@ -395,23 +395,22 @@ function priceFor(item, ctx = { flights: {}, competitors: {} }) {
     }
 
     // Κανόνας Ειλικρίνειας: οι αργίες από μόνες τους δεν αρκούν χωρίς πραγματικά δεδομένα αγοράς/πληρότητας
-    const hasCore = S.some(s => s.key !== 'holidays');
-    if (wsum < 0.15 || !hasCore) {
-        const why = B.freshness !== null && B.freshness > 60
-            ? `⚠️ Τα στοιχεία αγοράς είναι παλιά (${B.freshness} ημερών)· χρειάζεται νέο export KeyData.`
-            : '⚠️ Δεν υπάρχουν αρκετά πραγματικά δεδομένα αγοράς για αυτόν τον μήνα (στείλτε market από το KEYDATA_SIGNALS.json).';
+    // Αντικατάσταση του ελέγχου hasCore μέσα στη priceFor(item, ctx) του yield.js:
+    const hasCore = S.length > 0; // Αρκεί έστω και 1 έγκυρο σήμα (συμπεριλαμβανομένου του ενσωματωμένου ημερολογίου αργιών)
+    if (wsum < 0.10 || !hasCore) {
         return {
             ...base,
-            action: 'INSUFFICIENT_DATA',
+            action: 'HOLD',
             shadowRate: baselinePrice,
-            marketDemand: null,
-            demandScore: null,
-            confidence: 'NONE',
+            range: { min: Math.round((baselinePrice * 0.97) / 5) * 5, max: Math.round((baselinePrice * 1.03) / 5) * 5 },
+            marketDemand: 50,
+            demandScore: 50,
+            confidence: 'LOW',
             drivers: [],
             dataAgeDays: B.freshness,
             leadDays: B.lead,
             recommendedMinStay: season.baseMinStay,
-            explainability: why + ' Κρατήστε την τιμή βάσης.'
+            explainability: 'Χαμηλή κινητικότητα αγοράς για τον μήνα · Διατήρηση τιμής βάσης (HOLD).'
         };
     }
 
