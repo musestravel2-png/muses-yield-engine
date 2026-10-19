@@ -2,7 +2,9 @@ import axios from 'axios';
 import { Groq } from 'groq-sdk';
 
 // =====================================================================
-// MUSES · MASTER RATES ENGINE v3.2 — Αυτόνομος Σύμβουλος Δυναμικής Τιμολόγησης
+// MUSES · MASTER RATES ENGINE v3.3 — Αυτόνομος Σύμβουλος Δυναμικής Τιμολόγησης
+// v3.3: Beyond (OTA Data) για 3–6 υπνοδωμάτια: θέση τιμής έναντι ADR αγοράς (με περιθώριο premium ανά κατηγορία βίλας)
+//       & ρυθμός κρατήσεων partners έναντι ίδιας μέρας πέρσι · τα 1–2 υπνοδωμάτια αγνοούνται (άλλο, φθηνότερο δείγμα)
 // v3.2: αργίες ΜΟΝΟ συμπληρωματικά (όχι αύξηση χωρίς αγορά) · ήπια σύγκριση με πέρσι σε μικρά νούμερα ·
 //       ίδια προστασία πρώιμης σεζόν για αυξήσεις & μειώσεις · στοιχεία ΑΝΑ ΒΙΛΑ (villaOcc/villaOccLY/villaAdr)
 // 100% συμβατός με όλες τις υπάρχουσες κλήσεις (Master Rates Sheet & Muses PMS).
@@ -12,13 +14,14 @@ import { Groq } from 'groq-sdk';
 //   holidays: { "Γερμανία": 31, ... } (αν λείπει, υπολογίζεται αυτόματα από το ενσωματωμένο ημερολόγιο)
 //   sourceMarkets: { "Γερμανία": 0.35, ... } (αν λείπει, χρησιμοποιούνται τα βάρη αγορών Κρήτης)
 //   beyondPrice, regionalOccupancyProxy, floorPrice, ceilingPrice, villaOcc, villaOccLY, villaAdr
+//   beyondMarket: { zone, asOf, adr, adrLY, occ, occLYFinal, partner, partnerLY }  (Beyond · OTA Data, από το Master Rates v2.5)
 // =====================================================================
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const AVIATION_API_KEY = process.env.AVIATION_API_KEY;
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
-const ENGINE_VERSION = 'v3.2';
+const ENGINE_VERSION = 'v3.3';
 const MUSES_API_KEY = process.env.MUSES_API_KEY || '';
 
 const DATASETS = {
@@ -350,7 +353,44 @@ function buildSignals(item, ctx = { flights: {}, competitors: {} }) {
         });
     }
 
-    return { signals: S, pm, lead, freshness, adr, adrLY, revpar, revparLY, mAdr, occ, occLY, mOcc };
+    // 8. 📊 Beyond (OTA Data) — ΜΟΝΟ 3–6 υπνοδωμάτια
+    const bm = item.beyondMarket || {}, bZone = String(bm.zone || '');
+    let beyondPos = null;
+    if (/^[3-6]BR$/.test(bZone)) {
+        let bAge = null; if (bm.asOf) { const d = new Date(bm.asOf); if (!isNaN(d)) bAge = Math.max(0, Math.round((new Date() - d) / 86400000)); }
+        const bFresh = bAge === null ? 0.8 : (bAge <= 45 ? 1 : bAge <= 75 ? 0.65 : 0.35);
+        // 8α. Θέση τιμής: η δική μας (ADR βίλας ή τιμή βάσης) έναντι ADR αγοράς OTA. Οι κορυφαίες βίλες δικαιούνται premium.
+        const bAdr = num(bm.adr), ours = (mAdr !== null && mAdr > 0) ? mAdr : num(item.baselinePrice);
+        if (bAdr !== null && bAdr > 20 && ours && ours > 0) {
+            const as = num(item.assetScore) || 150, allow = as >= 180 ? 0.40 : as >= 160 ? 0.25 : 0.10;
+            const pos = ours / bAdr - 1;
+            beyondPos = Math.round(pos * 1000) / 10;
+            const over = pos > allow ? pos - allow : (pos < -0.10 ? pos + 0.10 : 0);   // ουδέτερη ζώνη: −10% … +premium
+            if (over !== 0) S.push({
+                key: 'beyondPricePos',
+                label: 'Θέση τιμής έναντι αγοράς (Beyond)',
+                value: clamp(-over / 0.5, -0.6, 0.6),
+                weight: 0.10 * bFresh,
+                real: true,
+                text: `Beyond ${bZone}: μέση τιμή αγοράς OTA €${Math.round(bAdr)} · εμείς €${Math.round(ours)} (${pos >= 0 ? '+' : ''}${Math.round(pos * 100)}%${pos > allow ? ', πάνω από το περιθώριο premium +' + Math.round(allow * 100) + '%' : (pos < -0.10 ? ', φθηνότεροι' : '')})`
+            });
+        }
+        // 8β. Ρυθμός κρατήσεων partners Beyond έναντι ίδιας μέρας πέρσι (ήπιο αντίβαρο στο KeyData)
+        const pN = num(bm.partner), pL = num(bm.partnerLY);
+        if (pN !== null && pL !== null && pL >= 1) {
+            const relB = clamp(pL / 15, 0.35, 1);
+            S.push({
+                key: 'beyondPace',
+                label: 'Ρυθμός κρατήσεων (Beyond partners)',
+                value: clamp(((pN - pL) / Math.max(pL, 10)) / 0.6, -1, 1),
+                weight: 0.10 * bFresh * relB,
+                real: true,
+                text: `Beyond ${bZone}: partners έχουν κλείσει ${pN.toFixed(0)}% έναντι ${pL.toFixed(0)}% την ίδια μέρα πέρσι`
+            });
+        }
+    }
+
+    return { signals: S, pm, lead, freshness, adr, adrLY, revpar, revparLY, mAdr, occ, occLY, mOcc, beyondPos, beyondZone: bZone };
 }
 
 // ── Κεντρικός Αλγόριθμος Τιμολόγησης (v3.0-PRO) ──
@@ -542,6 +582,7 @@ function priceFor(item, ctx = { flights: {}, competitors: {} }) {
         explainability: `Ζήτηση ${demandScore}/100 · ${action} (${adj >= 0 ? '+' : ''}${Math.round(adj * 100)}%) · Βεβαιότητα ${confidence}${minStayHint} · ${drivers.slice(0, 3).map(d => d.text).join(' · ')}`
     };
 
+    if (B.beyondPos !== null) out.beyondMarket = { zone: B.beyondZone, adr: num(item.beyondMarket.adr), positionPct: B.beyondPos };
     const bp = num(item.beyondPrice);
     if (bp && bp > 0) {
         const d = shadowRate / bp - 1;
@@ -656,6 +697,7 @@ export default async function handler(req, res) {
             flights: flights.source,
             competitors: competitors.source,
             keydata: items.some(i => i.market) ? 'PROVIDED' : 'MISSING',
+            beyond: items.some(i => i.beyondMarket && /^[3-6]BR$/.test(String(i.beyondMarket.zone || ''))) ? 'PROVIDED' : 'MISSING',
             holidays: items.some(i => i.holidays) ? 'PROVIDED' : 'BUILTIN_CALENDAR'
         };
 
