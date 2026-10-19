@@ -2,7 +2,9 @@ import axios from 'axios';
 import { Groq } from 'groq-sdk';
 
 // =====================================================================
-// MUSES · MASTER RATES ENGINE v3.0-PRO — Αυτόνομος Σύμβουλος Δυναμικής Τιμολόγησης
+// MUSES · MASTER RATES ENGINE v3.2 — Αυτόνομος Σύμβουλος Δυναμικής Τιμολόγησης
+// v3.2: αργίες ΜΟΝΟ συμπληρωματικά (όχι αύξηση χωρίς αγορά) · ήπια σύγκριση με πέρσι σε μικρά νούμερα ·
+//       ίδια προστασία πρώιμης σεζόν για αυξήσεις & μειώσεις · στοιχεία ΑΝΑ ΒΙΛΑ (villaOcc/villaOccLY/villaAdr)
 // 100% συμβατός με όλες τις υπάρχουσες κλήσεις (Master Rates Sheet & Muses PMS).
 // Υποστηριζόμενα πεδία ανά item:
 //   villaName, baselinePrice, month ("2027-07", "07/2027", "07. Ιούλιος", κ.λπ.), assetScore
@@ -16,7 +18,7 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const AVIATION_API_KEY = process.env.AVIATION_API_KEY;
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
-const ENGINE_VERSION = 'v3.0-PRO';
+const ENGINE_VERSION = 'v3.2';
 const MUSES_API_KEY = process.env.MUSES_API_KEY || '';
 
 const DATASETS = {
@@ -203,9 +205,10 @@ function buildSignals(item, ctx = { flights: {}, competitors: {} }) {
     const revparLY = num(mk.revparLY) ?? (occLY !== null && adrLY !== null ? (occLY / 100) * adrLY : null);
 
     // Υποστήριξη τόσο ζώνης Muses (musesOcc/musesAdr) όσο και μεμονωμένης βίλας (villaOcc/villaAdr) αν περαστεί
-    const mOcc = num(item.villaOcc) ?? num(mk.musesOcc);
+    const hasVilla = num(item.villaOcc) !== null;
+    const mOcc = hasVilla ? num(item.villaOcc) : num(mk.musesOcc);
     const mOccLY = num(item.villaOccLY);
-    const mAdr = num(item.villaAdr) ?? num(mk.musesAdr);
+    const mAdr = num(item.villaAdr);   // ADR κρατήσεων της ΒΙΛΑΣ (όχι της ζώνης Muses)· αλλιώς συγκρίνεται η τιμή βάσης
 
     let freshness = null;
     if (mk.asOf) {
@@ -215,13 +218,16 @@ function buildSignals(item, ctx = { flights: {}, competitors: {} }) {
     const fresh = freshness === null ? 1 : (freshness <= 30 ? 1 : freshness <= 60 ? 0.65 : 0.35);
 
     // 1. Ρυθμός Πληρότητας Αγοράς έναντι Πέρσι (KeyData Market Occupancy Pace)
+    // Αξιοπιστία σύγκρισης: με λίγες κλεισμένες νύχτες (π.χ. 7% πέρσι) το «+190%» είναι θόρυβος → μικρότερο βάρος
+    const rel = (occLY === null) ? 0.35 : clamp(occLY / 15, 0.35, 1);
     if (occ !== null && occLY !== null && occLY >= 1) {
         const pace = occ / occLY - 1;
+        const paceSafe = (occ - occLY) / Math.max(occLY, 10);   // διαφορά μονάδων επί τουλάχιστον 10% βάσης
         S.push({
             key: 'marketPace',
             label: 'Ρυθμός αγοράς έναντι πέρσι',
-            value: clamp(pace / 0.38, -1, 1),
-            weight: 0.30 * fresh,
+            value: clamp(paceSafe / 0.6, -1, 1),
+            weight: 0.30 * fresh * rel,
             real: true,
             text: `Η αγορά${mk.zone ? ' (' + mk.zone + ')' : ''} έχει κλείσει ${occ.toFixed(1)}% έναντι ${occLY.toFixed(1)}% πέρσι (${pace >= 0 ? '+' : ''}${Math.round(pace * 100)}%)`
         });
@@ -242,7 +248,7 @@ function buildSignals(item, ctx = { flights: {}, competitors: {} }) {
             key: 'marketAdrPace',
             label: 'Τάση τιμών αγοράς (ADR)',
             value: effVal,
-            weight: 0.12 * fresh,
+            weight: 0.12 * fresh * rel,
             real: true,
             text: `Μέση τιμή αγοράς €${Math.round(adr)} έναντι €${Math.round(adrLY)} πέρσι (${adrPace >= 0 ? '+' : ''}${Math.round(adrPace * 100)}%${revParTxt})${adrPace > 0.08 && occDropping ? ' [αντίσταση τιμής στην αγορά]' : ''}`
         });
@@ -253,11 +259,11 @@ function buildSignals(item, ctx = { flights: {}, competitors: {} }) {
         const mpi = mOcc / occ;
         S.push({
             key: 'ourPace',
-            label: 'Ρυθμός μας έναντι αγοράς (MPI)',
+            label: hasVilla ? 'Ρυθμός βίλας έναντι αγοράς (MPI)' : 'Ρυθμός Muses (ζώνη) έναντι αγοράς (MPI)',
             value: clamp((mpi - 1) / 0.45, -1, 1),
-            weight: 0.24 * fresh,
+            weight: (hasVilla ? 0.24 : 0.14) * fresh * rel,
             real: true,
-            text: `Γεμίζουμε ${mpi >= 1 ? mpi.toFixed(1) + '× γρηγορότερα' : (1 / Math.max(mpi, 0.05)).toFixed(1) + '× πιο αργά'} από την αγορά (${mOcc.toFixed(1)}% έναντι ${occ.toFixed(1)}%)`
+            text: `${hasVilla ? 'Η βίλα γεμίζει' : 'Οι βίλες Muses της ζώνης γεμίζουν'} ${mpi >= 1 ? mpi.toFixed(1) + '× γρηγορότερα' : (1 / Math.max(mpi, 0.05)).toFixed(1) + '× πιο αργά'} από την αγορά (${mOcc.toFixed(1)}% έναντι ${occ.toFixed(1)}%)`
         });
     }
 
@@ -286,6 +292,8 @@ function buildSignals(item, ctx = { flights: {}, competitors: {} }) {
             const weightsMap = hasCustomWeights ? item.sourceMarkets : DEFAULT_SOURCE_MARKETS;
             let weightedDaysScore = 0, activeShareSum = 0;
 
+            const dim = pm ? new Date(Date.UTC(pm.y, pm.m, 0)).getUTCDate() : 31;
+            activeEntries.forEach(e => { e[1] = Math.min(dim, num(e[1]) || 0); });   // ποτέ πάνω από τις ημέρες του μήνα
             activeEntries.forEach(([country, days]) => {
                 const share = num(weightsMap[country]) ?? 0.03;
                 weightedDaysScore += share * clamp((num(days) || 0) / 22, 0, 1);
@@ -305,7 +313,7 @@ function buildSignals(item, ctx = { flights: {}, competitors: {} }) {
                 key: 'holidays',
                 label: 'Διακοπές χωρών-πελατών',
                 value: clamp(intensity, 0.05, 1),
-                weight: 0.14,
+                weight: 0.06,   // η εποχικότητα υπάρχει ήδη στην τιμή βάσης → μόνο μικρή συμπληρωματική ώθηση
                 real: true,
                 text: `Διακοπές στον μήνα: ${top}`
             });
@@ -394,9 +402,8 @@ function priceFor(item, ctx = { flights: {}, competitors: {} }) {
         };
     }
 
-    // Κανόνας Ειλικρίνειας: οι αργίες από μόνες τους δεν αρκούν χωρίς πραγματικά δεδομένα αγοράς/πληρότητας
-    // Αντικατάσταση του ελέγχου hasCore μέσα στη priceFor(item, ctx) του yield.js:
-    const hasCore = S.length > 0; // Αρκεί έστω και 1 έγκυρο σήμα (συμπεριλαμβανομένου του ενσωματωμένου ημερολογίου αργιών)
+    // Κανόνας Ειλικρίνειας: χωρίς στοιχεία αγοράς/πληρότητας (μόνο αργίες) → ΤΙΜΗ ΒΑΣΗΣ (HOLD), ποτέ αύξηση από αργίες μόνο
+    const hasCore = S.some(s => s.key !== 'holidays');
     if (wsum < 0.10 || !hasCore) {
         return {
             ...base,
@@ -406,11 +413,12 @@ function priceFor(item, ctx = { flights: {}, competitors: {} }) {
             marketDemand: 50,
             demandScore: 50,
             confidence: 'LOW',
+            dataGap: true,
             drivers: [],
             dataAgeDays: B.freshness,
             leadDays: B.lead,
             recommendedMinStay: season.baseMinStay,
-            explainability: 'Χαμηλή κινητικότητα αγοράς για τον μήνα · Διατήρηση τιμής βάσης (HOLD).'
+            explainability: hasCore ? 'Πολύ λίγα στοιχεία αγοράς για τον μήνα · Διατήρηση τιμής βάσης (HOLD).' : 'Δεν υπάρχουν ακόμη στοιχεία αγοράς (KeyData) για τον μήνα · Διατήρηση τιμής βάσης (HOLD).'
         };
     }
 
@@ -418,7 +426,8 @@ function priceFor(item, ctx = { flights: {}, competitors: {} }) {
     // Σε >180 ημέρες πριν την άφιξη, προστατεύουμε την τιμή από πρόωρες μειώσεις (Early-Bird Shield)
     const earlyBirdShield = B.lead === null ? 1.0 : (B.lead > 180 ? 0.35 : (B.lead > 120 ? 0.65 : 1.0));
     const rawSignal = S.reduce((a, s) => a + s.weight * s.value, 0) / wsum; // -1 … +1
-    const effectiveSignal = rawSignal >= 0 ? rawSignal : rawSignal * earlyBirdShield;
+    const earlyUpShield = B.lead === null ? 1.0 : (B.lead > 180 ? 0.7 : (B.lead > 120 ? 0.85 : 1.0));   // νωρίς: και οι αυξήσεις πιο ήπιες
+    const effectiveSignal = rawSignal >= 0 ? rawSignal * earlyUpShield : rawSignal * earlyBirdShield;
     const demandScore = clamp(Math.round(50 + 50 * effectiveSignal), 1, 99);
 
     let adj = effectiveSignal * 0.15;
@@ -427,7 +436,7 @@ function priceFor(item, ctx = { flights: {}, competitors: {} }) {
 
     // ── Πίνακας 4 Τεταρτημορίων Τιμής × Όγκου (ARI × MPI = RGI) ──
     // ΔΙΟΡΘΩΣΗ: Αν το mAdr είναι 0/null (π.χ. 0 κρατήσεις), συγκρίνουμε το baselinePrice με το ADR της αγοράς!
-    const effectiveOurAdr = (B.mAdr !== null && B.mAdr > 0) ? B.mAdr : baselinePrice;
+    const effectiveOurAdr = (B.mAdr !== null && B.mAdr > 0) ? B.mAdr : baselinePrice;   // ADR βίλας αν έχει κρατήσεις, αλλιώς η τιμή βάσης
     let gapNote = null, quadrant = 'BALANCED', ari = null, mpi = null, rgi = null;
 
     if (B.adr !== null && B.adr > 0 && effectiveOurAdr > 0 && B.occ !== null && B.occ >= 1 && B.mOcc !== null) {
