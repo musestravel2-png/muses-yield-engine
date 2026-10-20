@@ -2,7 +2,9 @@ import axios from 'axios';
 import { Groq } from 'groq-sdk';
 
 // =====================================================================
-// MUSES · MASTER RATES ENGINE v3.3 — Αυτόνομος Σύμβουλος Δυναμικής Τιμολόγησης
+// MUSES · MASTER RATES ENGINE v3.4 — Αυτόνομος Σύμβουλος Δυναμικής Τιμολόγησης
+// v3.4: βίλα με 0 νύχτες για τον μήνα (villaNights = 0) = ΚΑΝΕΝΑ δείγμα βίλας → χρησιμοποιείται η ζώνη Muses (όχι «0%» με πλήρες βάρος) ·
+//       όπου υπάρχει δείγμα, ίδια αποτελέσματα με v3.3 · προεπιλεγμένο έτος μήνα από Σεπτέμβριο (ίδιο με Master Rates/PMS)
 // v3.3: Beyond (OTA Data) για 3–6 υπνοδωμάτια: θέση τιμής έναντι ADR αγοράς (με περιθώριο premium ανά κατηγορία βίλας)
 //       & ρυθμός κρατήσεων partners έναντι ίδιας μέρας πέρσι · τα 1–2 υπνοδωμάτια αγνοούνται (άλλο, φθηνότερο δείγμα)
 // v3.2: αργίες ΜΟΝΟ συμπληρωματικά (όχι αύξηση χωρίς αγορά) · ήπια σύγκριση με πέρσι σε μικρά νούμερα ·
@@ -13,7 +15,7 @@ import { Groq } from 'groq-sdk';
 //   market: { zone, asOf, occ, occLY, adr, adrLY, revpar, revparLY, musesOcc, musesAdr }
 //   holidays: { "Γερμανία": 31, ... } (αν λείπει, υπολογίζεται αυτόματα από το ενσωματωμένο ημερολόγιο)
 //   sourceMarkets: { "Γερμανία": 0.35, ... } (αν λείπει, χρησιμοποιούνται τα βάρη αγορών Κρήτης)
-//   beyondPrice, regionalOccupancyProxy, floorPrice, ceilingPrice, villaOcc, villaOccLY, villaAdr
+//   beyondPrice, regionalOccupancyProxy, floorPrice, ceilingPrice, villaOcc, villaOccLY, villaAdr, villaNights (v3.4)
 //   beyondMarket: { zone, asOf, adr, adrLY, occ, occLYFinal, partner, partnerLY }  (Beyond · OTA Data, από το Master Rates v2.5)
 // =====================================================================
 
@@ -21,7 +23,7 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const AVIATION_API_KEY = process.env.AVIATION_API_KEY;
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
-const ENGINE_VERSION = 'v3.3';
+const ENGINE_VERSION = 'v3.4';
 const MUSES_API_KEY = process.env.MUSES_API_KEY || '';
 
 const DATASETS = {
@@ -174,7 +176,7 @@ function parseMonth(m) {
     if (foundM) {
         const yrMatch = raw.match(/\b(20\d{2})\b/);
         const now = new Date();
-        const defaultYr = now.getMonth() >= 9 ? now.getFullYear() + 1 : now.getFullYear();
+        const defaultYr = now.getMonth() >= 8 ? now.getFullYear() + 1 : now.getFullYear();   // από Σεπτέμβριο (ίδιο με Master Rates/PMS)
         return { y: yrMatch ? +yrMatch[1] : defaultYr, m: foundM };
     }
     return null;
@@ -208,9 +210,11 @@ function buildSignals(item, ctx = { flights: {}, competitors: {} }) {
     const revparLY = num(mk.revparLY) ?? (occLY !== null && adrLY !== null ? (occLY / 100) * adrLY : null);
 
     // Υποστήριξη τόσο ζώνης Muses (musesOcc/musesAdr) όσο και μεμονωμένης βίλας (villaOcc/villaAdr) αν περαστεί
-    const hasVilla = num(item.villaOcc) !== null;
+    // v3.4: «0 νύχτες» = 0 από 0 (κανένα δείγμα), όχι πληρότητα 0% → η βίλα αντιμετωπίζεται σαν να μην έχει στοιχεία
+    const noVillaSample = num(item.villaNights) === 0;
+    const hasVilla = num(item.villaOcc) !== null && !noVillaSample;
     const mOcc = hasVilla ? num(item.villaOcc) : num(mk.musesOcc);
-    const mOccLY = num(item.villaOccLY);
+    const mOccLY = noVillaSample ? null : num(item.villaOccLY);
     const mAdr = num(item.villaAdr);   // ADR κρατήσεων της ΒΙΛΑΣ (όχι της ζώνης Muses)· αλλιώς συγκρίνεται η τιμή βάσης
 
     let freshness = null;
