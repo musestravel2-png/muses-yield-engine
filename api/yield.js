@@ -3,6 +3,8 @@ import { Groq } from 'groq-sdk';
 
 // =====================================================================
 // MUSES · MASTER RATES ENGINE v4.0 — PRICE BRAIN: μία προτεινόμενη τιμή από όλα τα δεδομένα
+// v4.1: η τιμή της αγοράς (τι πλήρωσε ο πελάτης) μετατρέπεται στην κλίμακα της Τελικής Τιμής, όπως ήδη οι πωλήσεις μας
+//       (÷ πόσο πάνω/κάτω από την Τελική πουλάμε συνήθως) → η «Δίκαιη τιμή» συγκρίνεται με την Τελική στην ίδια βάση
 // v4.0: όταν το item έχει «brain» (Master Rates v3.0 / PMS v65): 5 στρώσεις — άγκυρα (Τελική Τιμή) → δίκαιη τιμή
 //       (αγορά KeyData/Beyond × πρεμιούμ ποιότητας από την Asset Database, μαθημένο στις βίλες μας, + πραγματοποιημένες τιμές κρατήσεων)
 //       → συνδυασμός → ζήτηση (όλα τα σήματα της v3.4 + κενά + booking window + διόρθωση μάθησης) → σημάνσεις (−15% ιδιοκτήτης, ±40% δεδομένα).
@@ -27,7 +29,7 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const AVIATION_API_KEY = process.env.AVIATION_API_KEY;
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
-const ENGINE_VERSION = 'v4.0';
+const ENGINE_VERSION = 'v4.1';
 const MUSES_API_KEY = process.env.MUSES_API_KEY || '';
 
 const DATASETS = {
@@ -635,7 +637,8 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
     const shoulder = mo === 4 || mo === 5 || mo === 10;
     if (A && A.heated && shoulder) premium += 0.03;                       // θερμαινόμενη πισίνα: μετράει Απρίλιο, Μάιο, Οκτώβριο
     let fw = 0, fs = 0; const parts = [];
-    if (mAdr) { const fp = mAdr * (1 + premium); fw += 1; fs += fp; parts.push(`αγορά ${mTxt} ${premium >= 0 ? '+' : '−'}${pc(premium)} ποιότητα`); }
+    if (mAdr) { const fp = mAdr * (1 + premium) / f; fw += 1;   // v4.1: ίδια βάση με τις πωλήσεις (÷ f)
+        fs += fp; parts.push(`αγορά ${mTxt} ${premium >= 0 ? '+' : '−'}${pc(premium)} ποιότητα`); }
     const nLY = num(b.nightsLY), aLY = num(b.adrLY);
     if (aLY > 0 && nLY >= 5) {
         const g = (num(mk.adr) > 20 && num(mk.adrLY) > 20) ? clamp(mk.adr / mk.adrLY, 0.85, 1.25) : 1;
