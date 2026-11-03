@@ -3,6 +3,10 @@ import { Groq } from 'groq-sdk';
 
 // =====================================================================
 // MUSES · MASTER RATES ENGINE v4.0 — PRICE BRAIN: μία προτεινόμενη τιμή από όλα τα δεδομένα
+// v4.3: ΤΡΙΑ ΣΗΜΕΙΑ ΑΝΑΦΟΡΑΣ για την τιμή αγοράς (KeyData · Beyond · Wheelhouse, ίδια ζώνη υπνοδωματίων):
+//       «2 από 3» — αν KeyData και Beyond απέχουν > 30% και το Wheelhouse συμφωνεί (±15%) με το ένα, το άλλο μένει εκτός ·
+//       πηγές που διαφωνούν (> 35%) → βεβαιότητα το πολύ «μέτρια» (πιο φαρδύ εύρος) · χρόνος κράτησης αγοράς (Wheelhouse) όταν λείπει ο δικός μας
+//       ΧΩΡΙΣ Wheelhouse: ακριβώς ίδια αποτελέσματα με v4.2
 // v4.2: Wheelhouse (item.wheelhouse από το Master Rates v3.7): σύγκριση της πρότασής μας με την πρόταση Wheelhouse για τη βίλα
 //       → πεδίο «wheelhouse» στο αποτέλεσμα · ΜΟΝΟ πληροφορία: δεν αλλάζει την τιμή (το δωρεάν Wheelhouse δεν είναι ρυθμισμένο στις βίλες μας)
 // v4.1: η τιμή της αγοράς (τι πλήρωσε ο πελάτης) μετατρέπεται στην κλίμακα της Τελικής Τιμής, όπως ήδη οι πωλήσεις μας
@@ -32,7 +36,7 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const AVIATION_API_KEY = process.env.AVIATION_API_KEY;
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
-const ENGINE_VERSION = 'v4.2';
+const ENGINE_VERSION = 'v4.3';
 const MUSES_API_KEY = process.env.MUSES_API_KEY || '';
 
 const DATASETS = {
@@ -642,6 +646,24 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
     if (kdAdr > 20 && byAdr > 20) { mAdr = kdAdr * 0.6 + byAdr * 0.4; mTxt = `KeyData €${Math.round(kdAdr)} · Beyond €${Math.round(byAdr)}`; }
     else if (kdAdr > 20) { mAdr = kdAdr; mTxt = `KeyData €${Math.round(kdAdr)}`; }
     else if (byAdr > 20) { mAdr = byAdr; mTxt = `Beyond €${Math.round(byAdr)}`; }
+    // 🔺 v4.3: τρία σημεία αναφοράς (ίδια ζώνη, ποτέ «Όλα»: το Wheelhouse «Όλα» μετρά και διαμερίσματα/ξενοδοχεία)
+    const whM = item.wheelhouse || {}, whZ = String(whM.zone || ''), whAdr = (/^[1-6]BR$/.test(whZ) && whZ === String(mk.zone || bm.zone || '')) ? num(whM.mktAdr) : null;
+    let tri = null;
+    {
+        const V = {}; if (kdAdr > 20) V.KeyData = kdAdr; if (byAdr > 20) V.Beyond = byAdr; if (whAdr > 20) V.Wheelhouse = whAdr;
+        const K = Object.keys(V);
+        if (whAdr > 20 && K.length >= 2) {
+            tri = { n: K.length, out: null, keydata: kdAdr > 20 ? Math.round(kdAdr) : null, beyond: byAdr > 20 ? Math.round(byAdr) : null, wheelhouse: Math.round(whAdr) };
+            if (kdAdr > 20 && byAdr > 20 && Math.abs(kdAdr / byAdr - 1) > 0.30) {
+                const dk = Math.abs(kdAdr / whAdr - 1), db = Math.abs(byAdr / whAdr - 1);
+                if (dk <= 0.15 && db > 0.30) { mAdr = kdAdr; tri.out = 'Beyond'; mTxt = `KeyData €${Math.round(kdAdr)} (Beyond €${Math.round(byAdr)} εκτός: διαφωνεί με KeyData & Wheelhouse €${Math.round(whAdr)})`; }
+                else if (db <= 0.15 && dk > 0.30) { mAdr = byAdr; tri.out = 'KeyData'; mTxt = `Beyond €${Math.round(byAdr)} (KeyData €${Math.round(kdAdr)} εκτός: διαφωνεί με Beyond & Wheelhouse €${Math.round(whAdr)})`; }
+            }
+            const keep = K.filter(k => k !== tri.out).map(k => V[k]);
+            tri.spreadPct = Math.round((Math.max(...keep) / Math.min(...keep) - 1) * 100);
+            tri.verdict = tri.spreadPct <= 15 ? 'συμφωνούν' : tri.spreadPct <= 35 ? 'κοντά' : 'διαφωνούν';
+        }
+    }
     const cal = b.cal || {}, ca = num(cal.a) ?? 0, cb = num(cal.b) ?? 0.015;
     const A = b.asset || null, score = A ? num(A.score) : null, conf = A ? (num(A.conf) ?? 0.5) : 0;
     const ageW = A && num(A.ageM) !== null && A.ageM > 12 ? 0.5 : 1;   // αξιολόγηση > 12 μηνών: μισό βάρος
@@ -666,7 +688,7 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
     const mid = fair ? anchor * (1 - wFair) + fair * wFair : anchor;
     // ── 4. Ζήτηση ──
     let eff = (num(v3.demandScore) !== null ? (v3.demandScore - 50) / 50 : 0);
-    const win = num(b.leadDays) ?? num(b.window);
+    const win = num(b.leadDays) ?? num(b.window) ?? num(whM.mktLead);   // v4.3: αλλιώς ο χρόνος κράτησης της αγοράς (Wheelhouse)
     const tooEarly = win !== null && lead !== null && lead > win + 30;
     const damped = tooEarly && eff < 0; if (damped) eff *= 0.5;            // πολύ νωρίς για να κριθεί αρνητικά
     const scale = clamp(num(b.learn && b.learn.demandScale) ?? 1, 0.7, 1.3);
@@ -684,7 +706,8 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
     if (pct < -0.15) flags.push('OWNER');
     if (Math.abs(pct) > 0.40) flags.push('DATA');
     const action = pct > 0.02 ? 'YIELD_UP' : pct < -0.02 ? 'YIELD_DOWN' : 'HOLD';
-    const confidence = (fair && cF >= 0.6 && v3.confidence !== 'LOW') ? 'HIGH' : (fair || v3.confidence !== 'LOW') ? 'MEDIUM' : 'LOW';
+    let confidence = (fair && cF >= 0.6 && v3.confidence !== 'LOW') ? 'HIGH' : (fair || v3.confidence !== 'LOW') ? 'MEDIUM' : 'LOW';
+    if (tri && tri.verdict === 'διαφωνούν' && confidence === 'HIGH') confidence = 'MEDIUM';   // v4.3: οι πηγές αγοράς διαφωνούν → πιο φαρδύ εύρος
     const band = confidence === 'HIGH' ? 0.03 : confidence === 'MEDIUM' ? 0.05 : 0.08;
     const fairR = fair ? r5(fair) : null;
     // ── Στρατηγική: τι κάνω τώρα ──
@@ -695,6 +718,8 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
     else if (eff < -0.2 && fair && anchor <= fair * 0.95) acts.push('Ζήτηση χαμηλή αλλά ήδη φθηνότεροι: όχι άλλη μείωση· έλεγξε προβολή, φωτογραφίες, ελάχιστη διαμονή');
     else if (eff < -0.2 && lead !== null && lead <= 60) acts.push('Ζήτηση χαμηλή κοντά στον μήνα: μείωση ή last-minute');
     else if (!acts.length) acts.push(action === 'HOLD' ? 'Κράτα την τιμή' : (action === 'YIELD_UP' ? 'Ήπια αύξηση' : 'Ήπια μείωση'));
+    if (tri && tri.out) acts.push(`Τιμή αγοράς: ${tri.out} εκτός (2 από 3 πηγές συμφωνούν) — έλεγξε το αρχείο ${tri.out}`);
+    else if (tri && tri.verdict === 'διαφωνούν') acts.push(`Οι πηγές αγοράς διαφωνούν (εύρος ${tri.spreadPct}%): βεβαιότητα το πολύ μέτρια`);
     if (!A) acts.push('Λείπει αξιολόγηση στην Asset Database (η δίκαιη τιμή στηρίζεται μόνο σε αγορά & κρατήσεις)');
     else if (ageW < 1) acts.push('Η αξιολόγηση είναι παλιότερη από 12 μήνες: νέα αξιολόγηση');
     // ── Λόγοι (οι 3 ισχυρότεροι) ──
@@ -719,6 +744,7 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
         note,
         explainability: `${head} · ${top3.join(' · ')}`,
         wheelhouse: wheelhouseInfo(item, shadowRate) || undefined,   // 🛞 v4.2: σε σχέση με την ΤΕΛΙΚΗ πρόταση
+        market3: tri || undefined,   // 🔺 v4.3: KeyData · Beyond · Wheelhouse
         brain: { marketAdr: mAdr ? Math.round(mAdr) : null, premiumPct: Math.round(premium * 1000) / 10, fairWeight: Math.round(wFair * 100) / 100,
                  demandAdjPct: Math.round(dAdj * 1000) / 10, gapAdjPct: Math.round(gAdj * 1000) / 10, biasPct: Math.round(bias * 500) / 10, feeFactor: Math.round(f * 100) / 100, kept }
     };
