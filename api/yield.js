@@ -3,6 +3,8 @@ import { Groq } from 'groq-sdk';
 
 // =====================================================================
 // MUSES · MASTER RATES ENGINE v4.0 — PRICE BRAIN: μία προτεινόμενη τιμή από όλα τα δεδομένα
+// v4.2: Wheelhouse (item.wheelhouse από το Master Rates v3.7): σύγκριση της πρότασής μας με την πρόταση Wheelhouse για τη βίλα
+//       → πεδίο «wheelhouse» στο αποτέλεσμα · ΜΟΝΟ πληροφορία: δεν αλλάζει την τιμή (το δωρεάν Wheelhouse δεν είναι ρυθμισμένο στις βίλες μας)
 // v4.1: η τιμή της αγοράς (τι πλήρωσε ο πελάτης) μετατρέπεται στην κλίμακα της Τελικής Τιμής, όπως ήδη οι πωλήσεις μας
 //       (÷ πόσο πάνω/κάτω από την Τελική πουλάμε συνήθως) → η «Δίκαιη τιμή» συγκρίνεται με την Τελική στην ίδια βάση
 // v4.0: όταν το item έχει «brain» (Master Rates v3.0 / PMS v65): 5 στρώσεις — άγκυρα (Τελική Τιμή) → δίκαιη τιμή
@@ -23,13 +25,14 @@ import { Groq } from 'groq-sdk';
 //   sourceMarkets: { "Γερμανία": 0.35, ... } (αν λείπει, χρησιμοποιούνται τα βάρη αγορών Κρήτης)
 //   beyondPrice, regionalOccupancyProxy, floorPrice, ceilingPrice, villaOcc, villaOccLY, villaAdr, villaNights (v3.4)
 //   beyondMarket: { zone, asOf, adr, adrLY, occ, occLYFinal, partner, partnerLY }  (Beyond · OTA Data, από το Master Rates v2.5)
+//   wheelhouse: { asOf, villa, rec, obs, recDays, zone, mktOccNow, mktOccExp, mktAdr }  (Wheelhouse, από το Master Rates v3.7 · μόνο πληροφορία)
 // =====================================================================
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const AVIATION_API_KEY = process.env.AVIATION_API_KEY;
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
-const ENGINE_VERSION = 'v4.1';
+const ENGINE_VERSION = 'v4.2';
 const MUSES_API_KEY = process.env.MUSES_API_KEY || '';
 
 const DATASETS = {
@@ -155,6 +158,15 @@ async function getResilientAISummary(prompt, maxBudgetMs = 2800) {
 
 // ── Βοηθητικές Συναρτήσεις ──
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+// 🛞 v4.2: πρόταση Wheelhouse έναντι της δικής μας τιμής (μόνο πληροφορία)
+function wheelhouseInfo(item, rate) {
+    const w = item && item.wheelhouse, rec = w ? Number(w.rec) : NaN;
+    if (!(rec > 0) || !(rate > 0)) return null;
+    const d = rate / rec - 1, o = { rec: Math.round(rec), deltaPct: Math.round(d * 1000) / 10, verdict: Math.abs(d) <= 0.10 ? 'Κοντά στο Wheelhouse' : (d > 0 ? 'Πάνω από το Wheelhouse' : 'Κάτω από το Wheelhouse'), info: true };
+    if (Number(w.obs) > 0) o.obs = Math.round(Number(w.obs));
+    if (w.mktOccExp != null && isFinite(Number(w.mktOccExp))) o.market = { zone: w.zone || 'ALL', occNow: w.mktOccNow != null ? Number(w.mktOccNow) : null, occExp: Number(w.mktOccExp), adr: w.mktAdr != null ? Number(w.mktAdr) : null };
+    return o;
+}
 const num = v => (v === null || v === undefined || v === '' || isNaN(Number(v))) ? null : Number(v);
 
 function parseMonth(m) {
@@ -602,6 +614,7 @@ function priceFor(item, ctx = { flights: {}, competitors: {} }) {
             verdict: Math.abs(d) <= 0.05 ? 'Συμφωνία με Beyond' : (d > 0 ? 'Πάνω από το Beyond' : 'Κάτω από το Beyond')
         };
     }
+    const whI = wheelhouseInfo(item, shadowRate); if (whI) out.wheelhouse = whI;   // 🛞 v4.2
     return out;
 }
 
@@ -705,6 +718,7 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
         strategy: acts,
         note,
         explainability: `${head} · ${top3.join(' · ')}`,
+        wheelhouse: wheelhouseInfo(item, shadowRate) || undefined,   // 🛞 v4.2: σε σχέση με την ΤΕΛΙΚΗ πρόταση
         brain: { marketAdr: mAdr ? Math.round(mAdr) : null, premiumPct: Math.round(premium * 1000) / 10, fairWeight: Math.round(wFair * 100) / 100,
                  demandAdjPct: Math.round(dAdj * 1000) / 10, gapAdjPct: Math.round(gAdj * 1000) / 10, biasPct: Math.round(bias * 500) / 10, feeFactor: Math.round(f * 100) / 100, kept }
     };
@@ -814,6 +828,7 @@ export default async function handler(req, res) {
             competitors: competitors.source,
             keydata: items.some(i => i.market) ? 'PROVIDED' : 'MISSING',
             beyond: items.some(i => i.beyondMarket && /^[3-6]BR$/.test(String(i.beyondMarket.zone || ''))) ? 'PROVIDED' : 'MISSING',
+            wheelhouse: items.some(i => i && i.wheelhouse) ? 'PROVIDED (info)' : 'MISSING',
             holidays: items.some(i => i.holidays) ? 'PROVIDED' : 'BUILTIN_CALENDAR'
         };
 
@@ -833,6 +848,7 @@ export default async function handler(req, res) {
                 recommendedMinStay: r.recommendedMinStay,
                 drivers: r.drivers,
                 beyond: r.beyond,
+                wheelhouse: r.wheelhouse,
                 explainability: r.explainability,
                 dataQuality
             });
