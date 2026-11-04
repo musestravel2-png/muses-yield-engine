@@ -3,6 +3,16 @@ import { Groq } from 'groq-sdk';
 
 // =====================================================================
 // MUSES · MASTER RATES ENGINE v4.0 — PRICE BRAIN: μία προτεινόμενη τιμή από όλα τα δεδομένα
+// v4.5: 🏛️ ΠΟΙΟΤΗΤΑ & ΙΣΤΟΡΙΚΟ ΚΑΘΟΡΙΖΟΥΝ ΤΗ ΘΕΣΗ — η αξιολόγηση (Asset Database) γίνεται ισχυρός παράγοντας, όχι διακοσμητικός:
+//       • θέση-στόχος έναντι αγοράς: +0,9% ανά βαθμό πάνω/κάτω από το 150 (185 → +31%, 140 → −9%), όρια −20%…+45%
+//       • ιστορικό: τι πούλησε πέρσι η βίλα (× κίνηση αγοράς) — με ισχυρό ιστορικό (30+ νύχτες) βαραίνει έως 60%, πάντα μέσα σε
+//         ζώνη γύρω από την ποιότητα (−15…+30 μονάδες): ούτε μια τυχερή χρονιά απογειώνει μέτρια βίλα, ούτε μια κακή ρίχνει καλή
+//       • ζήτηση ανά κατηγορία: αυξήσεις ×0,5 κάτω από 150 · ×0,8 έως 165 · ×1,2 από 180 (και μειώσεις ×0,8 για τις κορυφαίες)
+//       • ΚΟΦΤΗΣ: η πρόταση δεν ξεπερνά τη δίκαιη τιμή πάνω από +10% (<150) · +15% (<165) · +22% (<180) · +30% (180+)
+//         και την περσινή πώληση (× αγορά) πάνω από +3% (<150) · +8% (<165) · +12% (<180) · +20% (180+)
+//       • ΑΠΕΛΕΥΘΕΡΩΣΗ: βίλα 175+ που μένει πάνω από 10% κάτω από τη δίκαιη → ανεβαίνει έως εκεί (έως +15% την φορά)
+//       • ΣΥΝΕΠΕΙΑ: ίδια περιοχή & υπνοδωμάτια & μήνας: βίλα με 25+ βαθμούς χαμηλότερη αξιολόγηση δεν κοστίζει ούτε σχεδόν όσο η καλύτερη
+//         (τουλάχιστον 0,5% φθηνότερη ανά βαθμό διαφοράς, έως 25%)
 // v4.4: ημερολόγιο διακοπών 2026–2027 ενημερωμένο (ίδιο με το PMS v95, ενωμένα διαστήματα ανά χώρα → καμία διπλομέτρηση) ·
 //       νέες αγορές (ΗΠΑ & Καναδάς χωριστά, Ελλάδα, Ιταλία, Ιρλανδία, Τσεχία κ.ά.) · με μείγμα αγορών από τις ΔΙΚΕΣ μας κρατήσεις (sourceMarkets)
 //       μια χώρα που δεν μας φέρνει πελάτες μετρά 0,3% (όχι 3%)
@@ -39,7 +49,7 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const AVIATION_API_KEY = process.env.AVIATION_API_KEY;
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
-const ENGINE_VERSION = 'v4.4';
+const ENGINE_VERSION = 'v4.5';
 const MUSES_API_KEY = process.env.MUSES_API_KEY || '';
 
 const DATASETS = {
@@ -622,6 +632,18 @@ function portfolioFactor(items) {
     if (r.length < 5) return { f: 1, n: r.length };
     return { f: r[Math.floor(r.length / 2)], n: r.length };
 }
+// 🏛️ v4.5: κανόνες ποιότητας (Muses)
+const QUAL = {
+    slope: 0.009, min: -0.20, max: 0.45,                                   // θέση-στόχος έναντι αγοράς ανά βαθμό αξιολόγησης πάνω/κάτω από το 150
+    tier: s => s === null ? 'none' : s >= 180 ? 'top' : s >= 165 ? 'good' : s >= 150 ? 'std' : 'low',
+    band: { top: 0.30, good: 0.22, std: 0.15, low: 0.10, none: 0.20 },     // πόσο πάνω από τη δίκαιη τιμή επιτρέπεται
+    yoy: { top: 0.20, good: 0.12, std: 0.08, low: 0.03, none: 0.10 },      // πόσο πάνω από την περσινή πώληση × αγορά
+    up: { top: 1.2, good: 1.0, std: 0.8, low: 0.5, none: 1.0 },            // πολλαπλασιαστής αυξήσεων ζήτησης
+    down: { top: 0.8, good: 1.0, std: 1.0, low: 1.1, none: 1.0 },          // πολλαπλασιαστής μειώσεων ζήτησης
+    gShare: { top: 1.0, good: 1.0, std: 0.75, low: 0.5, none: 1.0 },      // πόσο από την άνοδο της αγοράς «δικαιούται» η βίλα στον κόφτη ιστορικού
+    step: { top: 0.30, good: 0.20, std: 0.12, low: 0.06, none: 0.15 },     // μέγιστη αύξηση ανά πρόταση έναντι της Τελικής (όχι σοκ)
+    label: { top: 'κορυφαία (180+)', good: 'πολύ καλή (165–180)', std: 'καλή (150–165)', low: 'μέτρια (κάτω από 150)', none: 'χωρίς αξιολόγηση' }
+};
 function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1, n: 0 }) {
     const v3 = priceFor(item, ctx);
     const anchor = num(item.baselinePrice), b = item.brain || {};
@@ -656,23 +678,34 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
     const A = b.asset || null, score = A ? num(A.score) : null, conf = A ? (num(A.conf) ?? 0.5) : 0;
     const ageW = A && num(A.ageM) !== null && A.ageM > 12 ? 0.5 : 1;   // αξιολόγηση > 12 μηνών: μισό βάρος
     const dq = score !== null ? (score - 150) / 10 * conf * ageW : 0;
-    let premium = Math.exp(ca + cb * dq) - 1;
+    // 🏛️ v4.5: θέση-στόχος από την ΑΞΙΟΛΟΓΗΣΗ (κανόνας Muses) — αν η μάθηση βρίσκει ισχυρότερη σχέση, κρατιέται η ισχυρότερη
+    const tier = QUAL.tier(score), qRule = score !== null ? clamp(QUAL.slope * (score - 150) * conf * ageW, QUAL.min, QUAL.max) : null;
+    const qLearn = score !== null ? Math.exp(ca + cb * dq) - 1 : null;
+    let premium = qRule === null ? Math.exp(ca) - 1 : (Math.abs(qLearn) > Math.abs(qRule) && Math.sign(qLearn) === Math.sign(qRule) ? clamp(qLearn, QUAL.min, QUAL.max) : qRule);
     const shoulder = mo === 4 || mo === 5 || mo === 10;
     if (A && A.heated && shoulder) premium += 0.03;                       // θερμαινόμενη πισίνα: μετράει Απρίλιο, Μάιο, Οκτώβριο
-    let fw = 0, fs = 0; const parts = [];
-    if (mAdr) { const fp = mAdr * (1 + premium) / f; fw += 1;   // v4.1: ίδια βάση με τις πωλήσεις (÷ f)
-        fs += fp; parts.push(`αγορά ${mTxt} ${premium >= 0 ? '+' : '−'}${pc(premium)} ποιότητα`); }
+    // Σύνθεση σε λογαριθμική κλίμακα (ποσοστά, όχι ευρώ): αγορά × ποιότητα · ιστορικό της βίλας · πωλήσεις φέτος
+    let fw = 0, fl = 0; const parts = []; let histTxt = '', wHist = 0, histPrice = null;
+    const qPrice = mAdr ? mAdr * (1 + premium) / f : null;   // v4.1: ίδια βάση με τις πωλήσεις (÷ f)
+    if (qPrice) { fw += 1; fl += Math.log(qPrice); parts.push(`αγορά ${mTxt} ${premium >= 0 ? '+' : '−'}${pc(premium)} ποιότητα`); }
     const nLY = num(b.nightsLY), aLY = num(b.adrLY);
+    const g = (num(mk.adr) > 20 && num(mk.adrLY) > 20) ? clamp(mk.adr / mk.adrLY, 0.85, 1.25) : 1;
     if (aLY > 0 && nLY >= 5) {
-        const g = (num(mk.adr) > 20 && num(mk.adrLY) > 20) ? clamp(mk.adr / mk.adrLY, 0.85, 1.25) : 1;
-        const w = Math.min(nLY / 14, 1) * 0.8, ev = aLY * g / f; fw += w; fs += ev * w; parts.push(`πέρσι πουλήθηκε €${Math.round(aLY)}${g !== 1 ? ` (αγορά ${g >= 1 ? '+' : '−'}${Math.abs(Math.round((g - 1) * 100))}%)` : ''}`);
+        histPrice = aLY * g / f;
+        if (qPrice && score !== null) {   // το ιστορικό μετρά μέσα σε ζώνη γύρω από την ποιότητα (−15 … +30 μονάδες)
+            const lo = mAdr * (1 + premium - 0.15) / f, hi = mAdr * (1 + premium + 0.30) / f, h0 = histPrice;
+            histPrice = clamp(histPrice, lo, hi); if (histPrice !== h0) histTxt = ` (περιορίστηκε στη ζώνη της ποιότητας από €${Math.round(h0)})`;
+        }
+        wHist = Math.min(nLY / 30, 1) * 1.5; fw += wHist; fl += wHist * Math.log(histPrice);
+        parts.push(`πέρσι πουλήθηκε €${Math.round(aLY)}${g !== 1 ? ` (αγορά ${g >= 1 ? '+' : '−'}${Math.abs(Math.round((g - 1) * 100))}%)` : ''} · ${Math.round(nLY)} νύχτες${histTxt}`);
     }
     const nCur = num(item.villaNights), aCur = num(item.villaAdr);
-    if (aCur > 0 && nCur >= 3) { const w = Math.min(nCur / 10, 1) * 0.8, ev = aCur / f; fw += w; fs += ev * w; parts.push(`οι κρατήσεις φέτος πουλήθηκαν €${Math.round(aCur)}/νύχτα`); }
-    const fair = fw > 0 ? fs / fw : null, cF = clamp(fw / 2, 0, 1);
+    if (aCur > 0 && nCur >= 3) { const w = Math.min(nCur / 10, 1) * 0.6, ev = aCur / f; fw += w; fl += w * Math.log(ev); parts.push(`οι κρατήσεις φέτος πουλήθηκαν €${Math.round(aCur)}/νύχτα`); }
+    const fair = fw > 0 ? Math.exp(fl / fw) : null, cF = clamp(fw / 2, 0, 1);
+    const tIdx = fair && mAdr ? fair * f / mAdr - 1 : null;   // θέση-στόχος έναντι αγοράς (με ποιότητα & ιστορικό)
     if (!fair && v3.dataGap) return v3;   // ούτε αγορά ούτε κρατήσεις: τιμή βάσης (κίτρινο), όπως πριν
     // ── 3. Συνδυασμός ──
-    const wFair = fair ? 0.25 + 0.35 * cF : 0;
+    const wFair = fair ? 0.30 + 0.40 * cF + (score !== null && wHist >= 1 ? 0.05 : 0) : 0;   // v4.5: η δίκαιη τιμή βαραίνει περισσότερο (έως 75%)
     const mid = fair ? anchor * (1 - wFair) + fair * wFair : anchor;
     // ── 4. Ζήτηση ──
     let eff = (num(v3.demandScore) !== null ? (v3.demandScore - 50) / 50 : 0);
@@ -681,16 +714,27 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
     const damped = tooEarly && eff < 0; if (damped) eff *= 0.5;            // πολύ νωρίς για να κριθεί αρνητικά
     const scale = clamp(num(b.learn && b.learn.demandScale) ?? 1, 0.7, 1.3);
     let dAdj = eff * 0.15 * scale;
+    const dRaw = dAdj; dAdj *= dAdj > 0 ? QUAL.up[tier] : QUAL.down[tier];   // 🏛️ v4.5: η ζήτηση «σηκώνει» περισσότερο την καλή βίλα από τη μέτρια
     const gapN = num(b.gapNights) ?? 0, gapNear = lead !== null && lead >= 0 && lead <= 45 && gapN >= 3;
     const gAdj = gapNear ? -Math.min(0.10, 0.02 + gapN * 0.01) : 0;
     const bias = clamp(num(b.learn && b.learn.bias) ?? 0, -0.1, 0.1);
     let price = mid * (1 + dAdj + gAdj) * (1 + bias * 0.5);
+    // ── 🏛️ v4.5: ΚΟΦΤΗΣ & ΑΠΕΛΕΥΘΕΡΩΣΗ ποιότητας ──
+    const guards = []; let cap = null;
+    if (fair && score !== null && score >= 175 && price < fair * 0.90 && eff > -0.15) {
+        const fl0 = Math.min(fair * 0.90, anchor * 1.15); if (fl0 > price) { price = fl0; guards.push(`Απελευθέρωση: ${QUAL.label[tier]} βίλα έμενε κάτω από τη δίκαιη → ανεβαίνει στα €${r5(price)}`); }
+    }
+    if (fair) { const c1 = fair * (1 + QUAL.band[tier]); if (price > c1) { cap = 'fair'; guards.push(`Κόφτης ποιότητας: ${QUAL.label[tier]} → έως +${Math.round(QUAL.band[tier] * 100)}% πάνω από τη δίκαιη (€${r5(c1)}) αντί €${r5(price)}`); price = c1; } }
+    if (aLY > 0 && nLY >= 5) { const gq = 1 + (g - 1) * (g > 1 ? QUAL.gShare[tier] : 1), c2 = aLY * gq / f * (1 + QUAL.yoy[tier]);
+        if (price > c2) { cap = 'yoy'; guards.push(`Κόφτης ιστορικού: ${QUAL.label[tier]} → έως +${Math.round(QUAL.yoy[tier] * 100)}% πάνω από την περσινή πώληση €${Math.round(aLY)}${gq !== 1 ? ` με ${gq >= 1 ? '+' : '−'}${Math.abs(Math.round((gq - 1) * 100))}% αγορά` : ''} (€${r5(c2)}) αντί €${r5(price)}`); price = c2; } }
+    { const c3 = anchor * (1 + QUAL.step[tier]); if (price > c3) { if (!cap) cap = 'step'; guards.push(`Σταδιακά: έως +${Math.round(QUAL.step[tier] * 100)}% έναντι της Τελικής ανά πρόταση (€${r5(c3)}) αντί €${r5(price)}`); price = c3; } }
     // ── σταθερότητα: δεν αλλάζει για < 2% από την προηγούμενη πρόταση ──
     const prev = num(b.prevShadow); let kept = false;
     if (prev > 0 && Math.abs(price / prev - 1) < 0.02) { price = prev; kept = true; }
     let shadowRate = r5(price);
     const pct = shadowRate / anchor - 1;
     const flags = [];
+    if (cap) flags.push(cap === 'step' ? 'STEP' : 'QUALITY');
     if (pct < -0.15) flags.push('OWNER');
     if (Math.abs(pct) > 0.40) flags.push('DATA');
     const action = pct > 0.02 ? 'YIELD_UP' : pct < -0.02 ? 'YIELD_DOWN' : 'HOLD';
@@ -708,6 +752,7 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
     else if (!acts.length) acts.push(action === 'HOLD' ? 'Κράτα την τιμή' : (action === 'YIELD_UP' ? 'Ήπια αύξηση' : 'Ήπια μείωση'));
     if (tri && tri.out) acts.push(`Τιμή αγοράς: ${tri.out} εκτός (2 από 3 πηγές συμφωνούν) — έλεγξε το αρχείο ${tri.out}`);
     else if (tri && tri.verdict === 'διαφωνούν') acts.push(`Οι πηγές αγοράς διαφωνούν (εύρος ${tri.spreadPct}%): βεβαιότητα το πολύ μέτρια`);
+    if (cap && anchor > price * 1.05) acts.push(`Η Τελική είναι ψηλά για ${QUAL.label[tier]} βίλα: μην την ανεβάζεις· ${anchor > shadowRate * 1.15 ? 'συζήτηση με ιδιοκτήτη για προσαρμογή' : 'κράτα ή μείωσε ήπια'}`);
     if (!A) acts.push('Λείπει αξιολόγηση στην Asset Database (η δίκαιη τιμή στηρίζεται μόνο σε αγορά & κρατήσεις)');
     else if (ageW < 1) acts.push('Η αξιολόγηση είναι παλιότερη από 12 μήνες: νέα αξιολόγηση');
     // ── Λόγοι (οι 3 ισχυρότεροι) ──
@@ -717,6 +762,8 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
         reasons.push({ w: Math.abs(dAdj), t: `Ζήτηση ${v3.demandScore}/100 → ${dAdj >= 0 ? '+' : '−'}${pc(dAdj)}${top ? ': ' + top : ''}${damped ? ' (νωρίς για μείωση: μετριάστηκε)' : ''}` }); }
     if (gAdj) reasons.push({ w: Math.abs(gAdj), t: `Κενό ${gapN} νυχτών σε ${lead} ημέρες → −${pc(gAdj)}` });
     if (Math.abs(bias) > 0.005) reasons.push({ w: Math.abs(bias) * 0.5, t: `Διόρθωση από τη μάθηση: ${bias > 0 ? 'οι προτάσεις έβγαιναν χαμηλά' : 'οι προτάσεις έβγαιναν ψηλά'} (${bias > 0 ? '+' : '−'}${Math.abs(Math.round(bias * 50))}%)` });
+    guards.forEach(t => reasons.push({ w: 1, t: t }));   // 🏛️ v4.5: οι κόφτες/απελευθέρωση εμφανίζονται πάντα πρώτοι
+    if (dRaw !== dAdj && Math.abs(dRaw) > 0.004) reasons.push({ w: Math.abs(dRaw - dAdj), t: `Ζήτηση για ${QUAL.label[tier]} βίλα: ${dRaw >= 0 ? '+' : '−'}${pc(dRaw)} → ${dAdj >= 0 ? '+' : '−'}${pc(dAdj)}` });
     reasons.sort((x, y) => y.w - x.w);
     const top3 = reasons.slice(0, 3).map(r => r.t);
     const flagTxt = (flags.includes('OWNER') ? '⚠️ Κάτω από −15% της Τελικής: απαιτεί ενημέρωση ιδιοκτήτη\n' : '') + (flags.includes('DATA') ? '⚠️ Αλλαγή πάνω από ±40%: έλεγξε τα δεδομένα\n' : '');
@@ -733,12 +780,47 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
         explainability: `${head} · ${top3.join(' · ')}`,
         wheelhouse: wheelhouseInfo(item, shadowRate) || undefined,   // 🛞 v4.2: σε σχέση με την ΤΕΛΙΚΗ πρόταση
         market3: tri || undefined,   // 🔺 v4.3: KeyData · Beyond · Wheelhouse
+        quality: { score: score, tier: tier, qualityPct: Math.round(premium * 1000) / 10, targetPct: tIdx === null ? null : Math.round(tIdx * 1000) / 10,
+                   histWeight: Math.round(wHist * 100) / 100, cap: cap, guards: guards, zone: String(mk.zone || bm.zone || ''), area: String(mk.area || bm.area || ''), month: item.month },   // 🏛️ v4.5
         brain: { marketAdr: mAdr ? Math.round(mAdr) : null, premiumPct: Math.round(premium * 1000) / 10, fairWeight: Math.round(wFair * 100) / 100,
                  demandAdjPct: Math.round(dAdj * 1000) / 10, gapAdjPct: Math.round(gAdj * 1000) / 10, biasPct: Math.round(bias * 500) / 10, feeFactor: Math.round(f * 100) / 100, kept }
     };
 }
 
-export { priceFor, buildSignals, parseMonth, getBuiltinHolidaysForMonth, priceForBrain, portfolioFactor };
+// 🏛️ v4.5 ΣΥΝΕΠΕΙΑ ΠΟΙΟΤΗΤΑΣ: ίδιος μήνας, ίδια υπνοδωμάτια, ίδια περιοχή → η βίλα με σαφώς χαμηλότερη αξιολόγηση (25+ βαθμούς)
+// δεν μπορεί να κοστίζει σχεδόν όσο ή περισσότερο από την καλύτερη: τουλάχιστον 0,5% φθηνότερη ανά βαθμό διαφοράς (έως 25%).
+// Μόνο ΜΕΙΩΝΕΙ τη χειρότερη (ποτέ δεν ανεβάζει αυτόματα την καλύτερη) · μόνο αξιολογήσεις με βεβαιότητα ≥ 50%.
+function qualityPeers(items, results) {
+    const G = {};
+    results.forEach((r, i) => { const q = r && r.quality, it = items[i] || {}, A = it.brain && it.brain.asset;
+        if (!q || q.score === null || !q.zone || !q.area || !(r.shadowRate > 0) || !A || (num(A.conf) ?? 0.5) < 0.5) return;
+        (G[q.month + '|' + q.zone + '|' + q.area.toLowerCase()] = G[q.month + '|' + q.zone + '|' + q.area.toLowerCase()] || []).push(i); });
+    let n = 0;
+    Object.keys(G).forEach(k => { const L = G[k]; if (L.length < 2) return;
+        L.sort((a, b) => results[b].quality.score - results[a].quality.score);
+        for (let j = 1; j < L.length; j++) { const lo = results[L[j]];
+            for (let h = 0; h < j; h++) { const hi = results[L[h]], gap = hi.quality.score - lo.quality.score; if (gap < 25) continue;
+                const lim = r5(hi.shadowRate * (1 - Math.min(0.25, 0.005 * gap)));
+                if (lo.shadowRate > lim) {
+                    const old = lo.shadowRate, hiName = String(items[L[h]].villaName || '').replace(/\s*\(.*\)\s*$/, ''), anchor = num(items[L[j]].baselinePrice) || old;
+                    lo.shadowRate = lim; const band = lo.range ? (lo.range.max - lo.range.min) / 2 / old : 0.05;
+                    lo.range = { min: r5(lim * (1 - band)), max: r5(lim * (1 + band)) };
+                    const pct = lim / anchor - 1; lo.action = pct > 0.02 ? 'YIELD_UP' : pct < -0.02 ? 'YIELD_DOWN' : 'HOLD';
+                    lo.flags = Array.from(new Set((lo.flags || []).concat(['QUALITY'].concat(pct < -0.15 ? ['OWNER'] : []))));
+                    const t = `Συνέπεια ποιότητας: η ${hiName} (αξιολόγηση ${Math.round(hi.quality.score)}) στην ίδια περιοχή & υπνοδωμάτια είναι στα €${hi.shadowRate} → αυτή (${Math.round(lo.quality.score)}) έως €${lim} αντί €${old}`;
+                    lo.quality.guards = (lo.quality.guards || []).concat([t]); lo.quality.peer = hiName;
+                    lo.explainability = `€${lim} (${pct >= 0 ? '+' : '−'}${Math.abs(Math.round(pct * 100))}% έναντι Τελικής) · ${t}` + (lo.explainability ? ' · πριν: ' + lo.explainability : '');
+                    if (lo.note) lo.note = `${t}\n` + lo.note;
+                    if (lo.wheelhouse && lo.wheelhouse.rec) { const d = lim / lo.wheelhouse.rec - 1; lo.wheelhouse.deltaPct = Math.round(d * 1000) / 10; }
+                    n++;
+                }
+            }
+        }
+    });
+    return n;
+}
+
+export { priceFor, buildSignals, parseMonth, getBuiltinHolidaysForMonth, priceForBrain, portfolioFactor, qualityPeers };
 
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -836,6 +918,7 @@ export default async function handler(req, res) {
         const ctx = { flights, competitors };
         const PF = portfolioFactor(items);   // 🧠 v4.0: Price Brain όπου υπάρχει «brain», αλλιώς ίδιο με v3.4
         const results = items.map(it => it && it.brain ? priceForBrain(it, ctx, PF) : priceFor(it, ctx));
+        let peerFixes = 0; try { peerFixes = qualityPeers(items, results); } catch (e) { console.error('qualityPeers', e.message); }   // 🏛️ v4.5
 
         const dataQuality = {
             flights: flights.source,
@@ -843,7 +926,8 @@ export default async function handler(req, res) {
             keydata: items.some(i => i.market) ? 'PROVIDED' : 'MISSING',
             beyond: items.some(i => i.beyondMarket && /^[3-6]BR$/.test(String(i.beyondMarket.zone || ''))) ? 'PROVIDED' : 'MISSING',
             wheelhouse: items.some(i => i && i.wheelhouse) ? 'PROVIDED (info)' : 'MISSING',
-            holidays: items.some(i => i.holidays) ? 'PROVIDED' : 'BUILTIN_CALENDAR'
+            holidays: items.some(i => i.holidays) ? 'PROVIDED' : 'BUILTIN_CALENDAR',
+            qualityPeerFixes: peerFixes
         };
 
         if (!body.items && results.length === 1) {
