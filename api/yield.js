@@ -3,6 +3,19 @@ import { Groq } from 'groq-sdk';
 
 // =====================================================================
 // MUSES · MASTER RATES ENGINE v4.0 — PRICE BRAIN: μία προτεινόμενη τιμή από όλα τα δεδομένα
+// v4.6: 📡 ΤΟΠΙΚΗ ΑΓΟΡΑ & ΝΕΑ ΣΗΜΑΤΑ — όλα τα νέα πεδία είναι προαιρετικά (χωρίς αυτά αλλάζουν μόνο τα σημεία ①–②):
+//       ① η θέση τιμής × ρυθμού της ΒΙΛΑΣ μετρά πλέον και στο Price Brain, έναντι της ΔΙΚΑΙΗΣ τιμής (όχι της ωμής αγοράς):
+//          φθηνότεροι & γεμίζουμε γρηγορότερα → αύξηση · ακριβότεροι & πιο αργά → μείωση (με τις προστασίες πρώιμης σεζόν & ποιότητας)
+//       ② το πλήθος πτήσεων (AviationStack) ΔΕΝ είναι πια σήμα: μετρούσε εποχή, όχι ζήτηση
+//       ③ item.local  { n, median, zoneMedian, zoneN, area, asOf, chg:{ n, avgPct, days }, occ, occPrev, occN }  (Spy · Τιμοκατάλογος):
+//          τοπικός δείκτης τιμής = διάμεση τιμή ανταγωνιστών στο ίδιο χωριό/γειτονικά (ίδια υπν., ίδιος μήνας) ÷ διάμεση όλης της ζώνης
+//          → διορθώνει την τιμή αγοράς της ζώνης για την ΠΕΡΙΟΧΗ (−20% … +25%, ανάλογα με το δείγμα) · chg = κινήσεις τιμών ανταγωνιστών
+//          από την προηγούμενη καταγραφή (σήμα ζήτησης) · occ/occPrev = % κλεισμένων ημερών ανταγωνιστών (όπου φαίνεται διαθεσιμότητα)
+//       ④ item.pickup { g14, g14LY }  μονάδες πληρότητας που κέρδισε η αγορά τις τελευταίες 14 ημέρες, φέτος & πέρσι (ταχύτητα κρατήσεων)
+//       ⑤ item.trends { idx, idxLY, asOf }  Google Trends (Pulse): μετρά κυρίως 60–200 ημέρες πριν (οι αναζητήσεις προηγούνται των κρατήσεων)
+//       ⑥ item.fares  { now, prev, ly, days, asOf }  μέση ΤΙΜΗ πτήσης προς HER/CHQ για τον μήνα: άνοδος νωρίς = ζήτηση ·
+//          πτώση μέσα στη σεζόν = οι αεροπορικές σπρώχνουν last minute (αδύναμη ζήτηση)
+//       ΣΥΓΚΡΙΣΗ: κάθε αποτέλεσμα φέρνει και «v45Rate» (τι θα πρότεινε η v4.5 με τα ίδια δεδομένα)
 // v4.5: 🏛️ ΠΟΙΟΤΗΤΑ & ΙΣΤΟΡΙΚΟ ΚΑΘΟΡΙΖΟΥΝ ΤΗ ΘΕΣΗ — η αξιολόγηση (Asset Database) γίνεται ισχυρός παράγοντας, όχι διακοσμητικός:
 //       • θέση-στόχος έναντι αγοράς: +0,9% ανά βαθμό πάνω/κάτω από το 150 (185 → +31%, 140 → −9%), όρια −20%…+45%
 //       • ιστορικό: τι πούλησε πέρσι η βίλα (× κίνηση αγοράς) — με ισχυρό ιστορικό (30+ νύχτες) βαραίνει έως 60%, πάντα μέσα σε
@@ -49,7 +62,8 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const AVIATION_API_KEY = process.env.AVIATION_API_KEY;
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
-const ENGINE_VERSION = 'v4.5';
+const ENGINE_VERSION = 'v4.6';
+let V45 = false;   // v4.6: true μόνο όσο υπολογίζεται η σύγκριση «τι θα έβγαζε η v4.5»
 const MUSES_API_KEY = process.env.MUSES_API_KEY || '';
 
 const DATASETS = {
@@ -348,7 +362,7 @@ function buildSignals(item, ctx = { flights: {}, competitors: {} }) {
     }
 
     // 6. Πτήσεις Ηρακλείου & Χανίων (AviationStack — ενεργό για κοντινούς μήνες)
-    if (ctx.flights?.real && near > 0) {
+    if (V45 && ctx.flights?.real && near > 0) {   // v4.6: το πλήθος πτήσεων δεν είναι πια σήμα
         const f = ctx.flights.intent === 'HIGH' ? 1 : ctx.flights.intent === 'LOW' ? -0.8 : 0.1;
         S.push({
             key: 'flights',
@@ -414,7 +428,49 @@ function buildSignals(item, ctx = { flights: {}, competitors: {} }) {
         }
     }
 
-    return { signals: S, pm, lead, freshness, adr, adrLY, revpar, revparLY, mAdr, occ, occLY, mOcc, beyondPos, beyondZone: bZone };
+    // ── 📡 v4.6: νέα σήματα (όλα προαιρετικά) ──
+    if (!V45) {
+        const L = item.local || {};
+        // 9. Κινήσεις τιμών ανταγωνιστών (Spy): πόσο άλλαξαν οι τιμές καταλόγου τους για τον μήνα από την προηγούμενη καταγραφή
+        const cg = L.chg || {}, cgN = num(cg.n), cgP = num(cg.avgPct);
+        if (cgN !== null && cgN >= 5 && cgP !== null && Math.abs(cgP) >= 0.3) {
+            S.push({ key: 'compMoves', label: 'Κινήσεις τιμών ανταγωνιστών (Spy)', value: clamp(cgP / 8, -1, 1), weight: 0.10 * clamp(cgN / 12, 0.5, 1), real: true,
+                text: `Οι ανταγωνιστές${L.area ? ' (' + L.area + ')' : ''} ${cgP >= 0 ? 'ανέβασαν' : 'κατέβασαν'} τις τιμές του μήνα κατά ${String(Math.abs(Math.round(cgP * 10) / 10)).replace('.', ',')}% (${Math.round(cgN)} καταλύματα${num(cg.days) ? ', σε ' + Math.round(cg.days) + ' ημέρες' : ''})` });
+        }
+        // 10. Πληρότητα ανταγωνιστών (Spy, όπου το γραφείο δείχνει διαθεσιμότητα): μεταβολή από την προηγούμενη καταγραφή
+        const co = num(L.occ), cp = num(L.occPrev), cn = num(L.occN);
+        if (co !== null && cp !== null && (cn === null || cn >= 5)) {
+            S.push({ key: 'compOcc', label: 'Πληρότητα ανταγωνιστών (Spy)', value: clamp((co - cp) / 8, -1, 1), weight: 0.08, real: true,
+                text: `Οι ανταγωνιστές έχουν κλείσει ${Math.round(co)}% του μήνα (από ${Math.round(cp)}% στην προηγούμενη καταγραφή)` });
+        }
+        // 11. Ταχύτητα κρατήσεων αγοράς: μονάδες πληρότητας τις τελευταίες 14 ημέρες, φέτος έναντι πέρσι
+        const pk = item.pickup || {}, g = num(pk.g14), gL = num(pk.g14LY);
+        if (g !== null && gL !== null && (lead === null || lead <= 240)) {
+            const x = (g - gL) / Math.max(gL, 2);
+            S.push({ key: 'pickup', label: 'Ταχύτητα κρατήσεων (14 ημέρες)', value: clamp(x / 0.6, -1, 1), weight: 0.14 * fresh, real: true,
+                text: `Η αγορά κέρδισε ${String(Math.round(g * 10) / 10).replace('.', ',')} μονάδες πληρότητας σε 14 ημέρες (πέρσι ${String(Math.round(gL * 10) / 10).replace('.', ',')})` });
+        }
+        // 12. Google Trends (Pulse): οι αναζητήσεις προηγούνται των κρατήσεων → μετρά κυρίως 60–200 ημέρες πριν
+        const tr = item.trends || {}, ti = num(tr.idx), tL = num(tr.idxLY);
+        const trW = lead === null ? 0.04 : (lead >= 60 && lead <= 200 ? 0.08 : lead > 200 ? 0.05 : lead >= 30 ? 0.04 : 0);
+        if (ti !== null && tL !== null && tL >= 5 && trW > 0) {
+            const x = ti / tL - 1;
+            S.push({ key: 'trends', label: 'Αναζητήσεις (Google Trends)', value: clamp(x / 0.3, -1, 1), weight: trW, real: true,
+                text: `Αναζητήσεις ${x >= 0 ? '+' : '−'}${Math.abs(Math.round(x * 100))}% έναντι πέρσι (δείκτης ${Math.round(ti)} έναντι ${Math.round(tL)})` });
+        }
+        // 13. ΤΙΜΕΣ πτήσεων προς HER/CHQ για τον μήνα: άνοδος νωρίς = ζήτηση · πτώση μέσα στη σεζόν = last minute από τις αεροπορικές
+        const fa = item.fares || {}, fN = num(fa.now), fP = num(fa.prev), fY = num(fa.ly);
+        if (fN !== null && fN > 0 && ((fP !== null && fP > 0) || (fY !== null && fY > 0))) {
+            const parts = []; if (fP > 0) parts.push(fN / fP - 1); if (fY > 0) parts.push(fN / fY - 1);
+            const x = parts.reduce((a, b) => a + b, 0) / parts.length, early = lead === null || lead > 60;
+            const val = early ? clamp(x / 0.15, -1, 1) : (x < 0 ? clamp(x / 0.12, -1, 0) : clamp(x / 0.20, 0, 1) * 0.5);
+            const w = early ? 0.08 : (x < 0 ? 0.08 : 0.05);
+            if (Math.abs(x) >= 0.02) S.push({ key: 'fares', label: 'Τιμές πτήσεων HER/CHQ', value: val, weight: w, real: true,
+                text: `Μέση τιμή πτήσης €${Math.round(fN)} (${x >= 0 ? '+' : '−'}${Math.abs(Math.round(x * 100))}%${fP > 0 ? ' από την προηγούμενη μέτρηση' : ' έναντι πέρσι'})${early ? (x > 0 ? ': ζήτηση νωρίς' : ': χαλαρή ζήτηση') : (x < 0 ? ': οι αεροπορικές ρίχνουν τιμές για last minute' : ': σφιχτές θέσεις')}` });
+        }
+    }
+
+    return { signals: S, pm, lead, freshness, adr, adrLY, revpar, revparLY, mAdr, occ, occLY, mOcc, beyondPos, beyondZone: bZone, hasVilla };
 }
 
 // ── Κεντρικός Αλγόριθμος Τιμολόγησης (v3.0-PRO) ──
@@ -598,7 +654,7 @@ function priceFor(item, ctx = { flights: {}, competitors: {} }) {
         action,
         confidence,
         quadrant,
-        metrics: { ari, mpi, rgi, marketRevPar: B.revpar ? Math.round(B.revpar) : null },
+        metrics: { ari, mpi, rgi, marketRevPar: B.revpar ? Math.round(B.revpar) : null, marketOcc: B.occ, ourOcc: B.mOcc, villaSample: !!B.hasVilla },   // v4.6: για τη θέση τιμής × ρυθμού στο Price Brain
         recommendedMinStay,
         drivers,
         leadDays: B.lead,
@@ -674,6 +730,17 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
             tri.verdict = tri.spreadPct <= 15 ? 'συμφωνούν' : tri.spreadPct <= 35 ? 'κοντά' : 'διαφωνούν';
         }
     }
+    // 📡 v4.6: τοπικός δείκτης τιμής (Spy): πόσο ακριβότερη/φθηνότερη είναι η ΠΕΡΙΟΧΗ της βίλας από το σύνολο της ζώνης
+    let localInfo = null;
+    if (!V45 && mAdr) {
+        const L = item.local || {}, lm = num(L.median), zm = num(L.zoneMedian), ln = num(L.n) ?? 0;
+        if (lm > 0 && zm > 0 && ln >= 3 && (num(L.zoneN) === null || L.zoneN >= 10)) {
+            const idx = lm / zm, w = Math.min(ln / 6, 1) * 0.7, k = clamp(1 + (idx - 1) * w, 0.80, 1.25);
+            localInfo = { n: ln, median: Math.round(lm), zoneMedian: Math.round(zm), indexPct: Math.round((idx - 1) * 1000) / 10, appliedPct: Math.round((k - 1) * 1000) / 10,
+                          vsUsPct: Math.round((anchor / lm - 1) * 1000) / 10, area: String(L.area || '') };
+            if (Math.abs(k - 1) >= 0.005) { mAdr *= k; mTxt += ` · περιοχή${L.area ? ' ' + L.area : ''} ${k >= 1 ? '+' : '−'}${pc(k - 1)} (${ln} ανταγωνιστές, διάμεση €${Math.round(lm)} έναντι €${Math.round(zm)} στη ζώνη)`; }
+        }
+    }
     const cal = b.cal || {}, ca = num(cal.a) ?? 0, cb = num(cal.b) ?? 0.015;
     const A = b.asset || null, score = A ? num(A.score) : null, conf = A ? (num(A.conf) ?? 0.5) : 0;
     const ageW = A && num(A.ageM) !== null && A.ageM > 12 ? 0.5 : 1;   // αξιολόγηση > 12 μηνών: μισό βάρος
@@ -718,7 +785,20 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
     const gapN = num(b.gapNights) ?? 0, gapNear = lead !== null && lead >= 0 && lead <= 45 && gapN >= 3;
     const gAdj = gapNear ? -Math.min(0.10, 0.02 + gapN * 0.01) : 0;
     const bias = clamp(num(b.learn && b.learn.bias) ?? 0, -0.1, 0.1);
-    let price = mid * (1 + dAdj + gAdj) * (1 + bias * 0.5);
+    // 📡 v4.6: ΘΕΣΗ ΤΙΜΗΣ × ΡΥΘΜΟΥ της βίλας έναντι της ΔΙΚΑΙΗΣ τιμής (η v4.5 την υπολόγιζε αλλά δεν την εφάρμοζε στο Price Brain)
+    let rAdj = 0, rTxt = '', rQuad = null;
+    { const M = v3.metrics || {}, mOccV = num(M.ourOcc), mktOcc = num(M.marketOcc);
+      if (!V45 && fair && M.villaSample && mOccV !== null && mktOcc !== null && mktOcc >= 5 && lead !== null && lead >= 0) {
+        const ariF = anchor / fair, mpiV = mOccV / mktOcc, earlyUp = lead > 180 ? 0.7 : lead > 120 ? 0.85 : 1, earlyDn = lead > 180 ? 0.35 : lead > 120 ? 0.65 : 1;
+        if (ariF < 0.95 && mpiV > 1.10) { rQuad = 'UNDERPRICED'; rAdj = clamp((1 - ariF) * 0.35, 0.02, 0.10) * 0.5 * QUAL.up[tier] * earlyUp;   // ×0,5: η δίκαιη τιμή τραβά ήδη προς τα πάνω
+            rTxt = `Η Τελική είναι ${Math.round((1 - ariF) * 100)}% κάτω από τη δίκαιη και η βίλα γεμίζει ${mpiV.toFixed(1).replace('.', ',')}× την αγορά (${Math.round(mOccV)}% έναντι ${Math.round(mktOcc)}%) → +${pc(rAdj)}`; }
+        else if (ariF >= 1.05 && mpiV >= 1.05) { rQuad = 'PREMIUM_POWER'; rAdj = clamp((mpiV - 1) * 0.15, 0.02, 0.06) * QUAL.up[tier] * earlyUp;
+            rTxt = `Η Τελική είναι ${Math.round((ariF - 1) * 100)}% πάνω από τη δίκαιη ΚΑΙ η βίλα γεμίζει γρηγορότερα από την αγορά (${Math.round(mOccV)}% έναντι ${Math.round(mktOcc)}%) → +${pc(rAdj)}`; }
+        else if (ariF > 1.05 && mpiV < 0.88) { rQuad = 'PRICE_RESISTANCE'; rAdj = -clamp((ariF - 1) * 0.35, 0.02, 0.12) * QUAL.down[tier] * earlyDn * (tooEarly ? 0.5 : 1);
+            rTxt = `Αντίσταση τιμής: η Τελική είναι ${Math.round((ariF - 1) * 100)}% πάνω από τη δίκαιη και η βίλα γεμίζει πιο αργά από την αγορά (${Math.round(mOccV)}% έναντι ${Math.round(mktOcc)}%) → −${pc(rAdj)}`; }
+        else if (ariF <= 0.95 && mpiV < 0.85) { rQuad = 'DEMAND_DEFICIT'; }
+      } }
+    let price = mid * (1 + dAdj + gAdj + rAdj) * (1 + bias * 0.5);
     // ── 🏛️ v4.5: ΚΟΦΤΗΣ & ΑΠΕΛΕΥΘΕΡΩΣΗ ποιότητας ──
     const guards = []; let cap = null;
     if (fair && score !== null && score >= 175 && price < fair * 0.90 && eff > -0.15) {
@@ -761,6 +841,9 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
     if (Math.abs(dAdj) > 0.004) { const top = (v3.drivers || []).filter(d => d.text && d.key !== 'priceGap').slice(0, 2).map(d => d.text).join(' · ');
         reasons.push({ w: Math.abs(dAdj), t: `Ζήτηση ${v3.demandScore}/100 → ${dAdj >= 0 ? '+' : '−'}${pc(dAdj)}${top ? ': ' + top : ''}${damped ? ' (νωρίς για μείωση: μετριάστηκε)' : ''}` }); }
     if (gAdj) reasons.push({ w: Math.abs(gAdj), t: `Κενό ${gapN} νυχτών σε ${lead} ημέρες → −${pc(gAdj)}` });
+    if (rAdj) reasons.push({ w: Math.abs(rAdj), t: rTxt });   // v4.6
+    if (rQuad === 'DEMAND_DEFICIT') acts.push('Η βίλα γεμίζει πιο αργά από την αγορά παρότι η Τελική είναι κάτω από τη δίκαιη: όχι μείωση· έλεγξε προβολή, φωτογραφίες, ελάχιστη διαμονή');
+    if (localInfo && Math.abs(localInfo.vsUsPct) >= 25) acts.push(`Η Τελική είναι ${localInfo.vsUsPct >= 0 ? Math.round(localInfo.vsUsPct) + '% πάνω' : Math.round(-localInfo.vsUsPct) + '% κάτω'} από τη διάμεση τιμή καταλόγου των ${localInfo.n} ανταγωνιστών της περιοχής (€${localInfo.median})`);
     if (Math.abs(bias) > 0.005) reasons.push({ w: Math.abs(bias) * 0.5, t: `Διόρθωση από τη μάθηση: ${bias > 0 ? 'οι προτάσεις έβγαιναν χαμηλά' : 'οι προτάσεις έβγαιναν ψηλά'} (${bias > 0 ? '+' : '−'}${Math.abs(Math.round(bias * 50))}%)` });
     guards.forEach(t => reasons.push({ w: 1, t: t }));   // 🏛️ v4.5: οι κόφτες/απελευθέρωση εμφανίζονται πάντα πρώτοι
     if (dRaw !== dAdj && Math.abs(dRaw) > 0.004) reasons.push({ w: Math.abs(dRaw - dAdj), t: `Ζήτηση για ${QUAL.label[tier]} βίλα: ${dRaw >= 0 ? '+' : '−'}${pc(dRaw)} → ${dAdj >= 0 ? '+' : '−'}${pc(dAdj)}` });
@@ -780,6 +863,8 @@ function priceForBrain(item, ctx = { flights: {}, competitors: {} }, P = { f: 1,
         explainability: `${head} · ${top3.join(' · ')}`,
         wheelhouse: wheelhouseInfo(item, shadowRate) || undefined,   // 🛞 v4.2: σε σχέση με την ΤΕΛΙΚΗ πρόταση
         market3: tri || undefined,   // 🔺 v4.3: KeyData · Beyond · Wheelhouse
+        local: localInfo || undefined,   // 📡 v4.6: τοπικός δείκτης (Spy)
+        position: rQuad ? { quadrant: rQuad, adjPct: Math.round(rAdj * 1000) / 10 } : undefined,   // 📡 v4.6: θέση τιμής × ρυθμού έναντι της δίκαιης
         quality: { score: score, tier: tier, qualityPct: Math.round(premium * 1000) / 10, targetPct: tIdx === null ? null : Math.round(tIdx * 1000) / 10,
                    histWeight: Math.round(wHist * 100) / 100, cap: cap, guards: guards, zone: String(mk.zone || bm.zone || ''), area: String(mk.area || bm.area || ''), month: item.month },   // 🏛️ v4.5
         brain: { marketAdr: mAdr ? Math.round(mAdr) : null, premiumPct: Math.round(premium * 1000) / 10, fairWeight: Math.round(wFair * 100) / 100,
@@ -821,6 +906,7 @@ function qualityPeers(items, results) {
 }
 
 export { priceFor, buildSignals, parseMonth, getBuiltinHolidaysForMonth, priceForBrain, portfolioFactor, qualityPeers };
+export function __setV45(x) { V45 = !!x; }   // μόνο για δοκιμές
 
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -917,8 +1003,11 @@ export default async function handler(req, res) {
         await Promise.all([fetchFlights(), fetchCompetitors()]);
         const ctx = { flights, competitors };
         const PF = portfolioFactor(items);   // 🧠 v4.0: Price Brain όπου υπάρχει «brain», αλλιώς ίδιο με v3.4
+        // 📡 v4.6: πρώτα «τι θα έβγαζε η v4.5» με τα ίδια δεδομένα (για σύγκριση), μετά η κανονική πρόταση
+        let r45 = []; try { V45 = true; r45 = items.map(it => it && it.brain ? priceForBrain(it, ctx, PF) : priceFor(it, ctx)); qualityPeers(items, r45); } catch (e) { r45 = []; console.error('v45 compare', e.message); } finally { V45 = false; }
         const results = items.map(it => it && it.brain ? priceForBrain(it, ctx, PF) : priceFor(it, ctx));
         let peerFixes = 0; try { peerFixes = qualityPeers(items, results); } catch (e) { console.error('qualityPeers', e.message); }   // 🏛️ v4.5
+        let changed46 = 0; results.forEach((r, i) => { const o = r45[i]; if (r && o && o.shadowRate > 0) { r.v45Rate = o.shadowRate; if (r.shadowRate !== o.shadowRate) changed46++; } });
 
         const dataQuality = {
             flights: flights.source,
@@ -927,7 +1016,12 @@ export default async function handler(req, res) {
             beyond: items.some(i => i.beyondMarket && /^[3-6]BR$/.test(String(i.beyondMarket.zone || ''))) ? 'PROVIDED' : 'MISSING',
             wheelhouse: items.some(i => i && i.wheelhouse) ? 'PROVIDED (info)' : 'MISSING',
             holidays: items.some(i => i.holidays) ? 'PROVIDED' : 'BUILTIN_CALENDAR',
-            qualityPeerFixes: peerFixes
+            qualityPeerFixes: peerFixes,
+            spy: items.some(i => i && i.local) ? 'PROVIDED' : 'MISSING',
+            pickup: items.some(i => i && i.pickup) ? 'PROVIDED' : 'MISSING',
+            trends: items.some(i => i && i.trends) ? 'PROVIDED' : 'MISSING',
+            fares: items.some(i => i && i.fares) ? 'PROVIDED' : 'MISSING',
+            changedVsV45: changed46
         };
 
         if (!body.items && results.length === 1) {
